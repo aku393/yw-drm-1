@@ -20,6 +20,9 @@ import requests
 import stat  # For setting file permissions
 import inspect  # For debugging class methods
 import random  # For generating unique file IDs
+import mmap  # For zero-copy file part reads to speed up uploads
+import re
+import sys
 from telethon.errors.rpcerrorlist import FloodWaitError  # Import FloodWaitError
 from collections import deque  # For task queue
 import json
@@ -79,6 +82,7 @@ user_task_queues = {}  # Format: {user_id: deque()}
 user_processing_states = {}  # Format: {user_id: bool}
 user_queue_locks = {}  # Format: {user_id: asyncio.Lock()}
 user_active_tasks = {}  # Format: {user_id: asyncio.Task()}
+user_bot_instances = {}  # Format: {user_id: MPDLeechBot}
 
 # JSON storage for loadjson/processjson functionality
 user_json_data = {}  # Format: {user_id: json_data}
@@ -425,31 +429,27 @@ async def save_thumbnail_from_message(event, user_id):
         return False, f"Error saving thumbnail: {str(e)}"
 
 def progress_display(stage, percent, done, total, speed, elapsed, user, user_id, filename):
-    bar_length = 10
-    filled = int(percent / 100 * bar_length)
-    pulse = ['▰', '▮', '▰', '▯'][int(time.time() * 2) % 4]
-    progress_bar = pulse * filled + '▱' * (bar_length - filled)
+    bar_length = 20
+    filled = int((percent / 100) * bar_length)
+    spinner = ['⣿', '⣷', '⣯', '⣟', '⡿', '⢿', '⣿'][int(time.time() * 10) % 7]
+    progress_bar = '█' * filled + '░' * (bar_length - filled)
     eta = (total - done) / speed if speed > 0 and done < total else 0
-    # Define stage-specific emojis and messages
     stage_info = {
-        "Downloading": ("📥", f"Downloading: {percent:.1f}%"),
-        "Decrypting": ("🔐", "Decrypting..."),
-        "Merging": ("🎬", "Merging..."),
-        "Uploading": ("📤", f"Uploading: {percent:.1f}%")
+        "Downloading": ("📥", f"Downloading {percent:.1f}%"),
+        "Decrypting": ("🔐", "Decrypting"),
+        "Merging": ("🎬", "Merging"),
+        "Uploading": ("📤", f"Uploading {percent:.1f}%"),
+        "Completed": ("✅", "Completed"),
+        "Initializing": ("🟡", "Initializing"),
     }
     emoji, status_text = stage_info.get(stage, ("🚀", stage))
     return (
-        f"#Task1: {filename}\n"
-        f"➜ [{progress_bar}] {percent:.1f}%\n"
-        f"➜ Stage: {status_text} {emoji}\n"
-        f"➜ Done: {format_size(done)} / {format_size(total)}\n"
-        f"➜ Speed: {format_size(speed)}/s ⚡\n"
-        f"➜ ETA: {format_time(eta)}\n"
-        f"➜ Elapsed: {format_time(elapsed)}\n"
-        f"➜ User: {user} 👤\n"
-        f"➜ UserID: {user_id}\n"
-        f"➜ Destination: Telegram MP4 📤\n"
-        f"➜ Engine: Python v1 🐍"
+        f"{spinner} {filename}\n"
+        f"{emoji} {status_text}\n"
+        f"[{progress_bar}] {percent:.1f}%\n"
+        f"⚡ {format_size(speed)}/s | ⏱️ {format_time(elapsed)} | ⌛ {format_time(eta)}\n"
+        f"📦 {format_size(done)} / {format_size(total)}\n"
+        f"👤 {user} | 🆔 {user_id}"
     )
 
 def parse_duration(duration_str):
@@ -477,6 +477,7 @@ class MPDLeechBot:
         self.progress_task = None  # To track the progress task
         self.update_lock = asyncio.Lock()  # Lock to prevent concurrent updates
         self.is_downloading = False  # Flag to prevent overlapping downloads in the same instance
+        self.current_filename = None  # Track current file name for /status
         # Progress tracking state
         self.progress_state = {
             'stage': 'Initializing',
@@ -526,9 +527,10 @@ class MPDLeechBot:
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
             }
 
-            timeout = aiohttp.ClientTimeout(total=3600)  # 1 hour timeout
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url, headers=headers) as response:
+            timeout = aiohttp.ClientTimeout(total=None, sock_connect=60, sock_read=60)
+            connector = aiohttp.TCPConnector(limit=0, enable_cleanup_closed=True)
+            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+                async with session.get(url, headers=headers, allow_redirects=True) as response:
                     if response.status != 200:
                         raise Exception(f"HTTP {response.status}: {response.reason}")
 
@@ -536,8 +538,8 @@ class MPDLeechBot:
                     self.progress_state['total_size'] = total_size
                     downloaded = 0
 
-                    with open(output_file, 'wb') as f:
-                        async for chunk in response.content.iter_chunked(1024 * 1024):  # 1MB chunks
+                    with open(output_file, 'wb', buffering=0) as f:
+                        async for chunk in response.content.iter_chunked(4 * 1024 * 1024):  # 4MB chunks
                             f.write(chunk)
                             downloaded += len(chunk)
                             self.progress_state['done_size'] = downloaded
@@ -683,7 +685,7 @@ class MPDLeechBot:
         num_chunks = int(file_size / max_size) + 1
 
         for i in range(num_chunks):
-            output_file = f"{base_name}_part{i+1}{ext}"
+            output_file = f"{base_name}_{str(i+1).zfill(3)}{ext}"
             start_time = i * chunk_duration
             cmd = ['ffmpeg', '-i', input_file, '-ss', str(start_time), '-t', str(chunk_duration), '-c', 'copy', output_file, '-y']
             logging.info(f"Splitting: {' '.join(cmd)}")
@@ -848,9 +850,9 @@ class MPDLeechBot:
                 while self.progress_state['stage'] != "Completed":
                     async with self.update_lock:  # Ensure only one update at a time
                         current_time = time.time()
-                        # Debounce: Only update if at least 30 seconds have passed since the last update
-                        if current_time - last_update_time < 30:
-                            await asyncio.sleep(1)
+                        # Debounce: Update frequently like leech channels
+                        if current_time - last_update_time < 3:
+                            await asyncio.sleep(0.2)
                             continue
                         self.progress_state['elapsed'] = current_time - self.progress_state['start_time']
                         self.progress_state['speed'] = self.progress_state['done_size'] / self.progress_state['elapsed'] if self.progress_state['elapsed'] > 0 else 0
@@ -877,7 +879,7 @@ class MPDLeechBot:
                         )
                         last_update_time = current_time
                         logging.info(f"Progress message updated: {self.progress_state['stage']} - {self.progress_state['percent']:.1f}%")
-                    await asyncio.sleep(10)  # Update every 10 seconds
+                    await asyncio.sleep(3)  # Update more frequently
                 logging.info(f"update_progress task completed for {name}")
 
             # Cancel any existing progress task with stricter cancellation
@@ -1046,8 +1048,12 @@ class MPDLeechBot:
             async def upload_part(file_id, part_num, part_size, total_parts, file_handle, progress, semaphore):
                 async with semaphore:  # Limit concurrent uploads
                     start = part_num * part_size
-                    file_handle.seek(start)
-                    data = file_handle.read(part_size)
+                    # Use mmap for zero-copy reads
+                    mm = mmap.mmap(file_handle.fileno(), length=0, access=mmap.ACCESS_READ)
+                    try:
+                        data = mm[start:start+part_size]
+                    finally:
+                        mm.close()
                     if not data:
                         return part_num, True, None
                     # Log the size of the data being uploaded
@@ -1122,15 +1128,15 @@ class MPDLeechBot:
                     logging.info(f"Chunk {i+1}: file_id={file_id}, chunk_size={chunk_size}, part_size={part_size}, total_parts={total_parts}")
                     if total_parts <= 0:
                         raise ValueError(f"Invalid total_parts for chunk {i+1}: {total_parts}")
-                    semaphore = asyncio.Semaphore(2)  # Maximum concurrent uploads
+                    semaphore = asyncio.Semaphore(6)  # Increase concurrency for speed
                     logging.info(f"Starting parallel upload for chunk {i+1}, size: {chunk_size}, total parts: {total_parts}, file_id: {file_id}")
 
                     async def update_progress():
                         nonlocal last_update_time, status_msg
                         while progress['uploaded'] < chunk_size:
                             current_time = time.time()
-                            if current_time - last_update_time < 10:
-                                await asyncio.sleep(0.1)
+                            if current_time - last_update_time < 3:
+                                await asyncio.sleep(0.2)
                                 continue
                             self.progress_state['elapsed'] = current_time - self.progress_state['start_time']
                             self.progress_state['speed'] = progress['uploaded'] / self.progress_state['elapsed'] if self.progress_state['elapsed'] > 0 else 0
@@ -1153,10 +1159,10 @@ class MPDLeechBot:
                                 )
                                 last_update_time = current_time
                                 logging.info(f"Upload progress updated for chunk {i+1}: {self.progress_state['percent']:.1f}%")
-                            await asyncio.sleep(10)  # Update every 10 seconds
+                            await asyncio.sleep(3)  # Update more frequently
 
                     upload_start = time.time()
-                    with open(chunk, 'rb') as f:
+                    with open(chunk, 'rb', buffering=0) as f:
                         tasks = []
                         for part_num in range(total_parts):
                             tasks.append(upload_part(file_id, part_num, part_size, total_parts, f, progress, semaphore))
@@ -1267,15 +1273,15 @@ class MPDLeechBot:
                 logging.info(f"Single file: file_id={file_id}, file_size={file_size}, part_size={part_size}, total_parts={total_parts}")
                 if total_parts <= 0:
                     raise ValueError(f"Invalid total_parts for single file: {total_parts}")
-                semaphore = asyncio.Semaphore(2)  # Maximum concurrent uploads
+                semaphore = asyncio.Semaphore(6)  # Increase concurrency for speed
                 logging.info(f"Starting parallel upload for file, size: {file_size}, total parts: {total_parts}, file_id: {file_id}")
 
                 async def update_progress():
                     nonlocal last_update_time, status_msg
                     while progress['uploaded'] < file_size:
                         current_time = time.time()
-                        if current_time - last_update_time < 30:
-                            await asyncio.sleep(1)
+                        if current_time - last_update_time < 3:
+                            await asyncio.sleep(0.2)
                             continue
                         self.progress_state['elapsed'] = current_time - self.progress_state['start_time']
                         self.progress_state['speed'] = progress['uploaded'] / self.progress_state['elapsed'] if self.progress_state['elapsed'] > 0 else 0
@@ -1298,7 +1304,7 @@ class MPDLeechBot:
                             )
                             last_update_time = current_time
                             logging.info(f"Upload progress updated: {self.progress_state['percent']:.1f}%")
-                        await asyncio.sleep(10)  # Update every 10 seconds
+                        await asyncio.sleep(3)  # Update more frequently
 
                 status_msg = await send_message_with_flood_control(
                     entity=event.chat_id,
@@ -1317,7 +1323,7 @@ class MPDLeechBot:
                 )
 
                 upload_start = time.time()
-                with open(filepath, 'rb') as f:
+                with open(filepath, 'rb', buffering=0) as f:
                     tasks = []
                     for part_num in range(total_parts):
                         tasks.append(upload_part(file_id, part_num, part_size, total_parts, f, progress, semaphore))
@@ -1407,6 +1413,7 @@ class MPDLeechBot:
         try:
             task_type = task_data.get('type', 'drm')
             name = task_data['name']
+            self.current_filename = f"{name}.mp4"
 
             if task_type == 'drm':
                 # DRM protected content
@@ -1498,6 +1505,8 @@ class MPDLeechBot:
     async def process_queue(self, event):
         """Process tasks in the queue one at a time for this user."""
         user_queue, user_states, user_lock = get_user_resources(self.user_id)
+        # Persist instance reference for status/speed lookups
+        user_bot_instances[self.user_id] = self
         logging.info(f"Starting queue processor for user {self.user_id}")
 
         total_initial_tasks = len(user_queue)  # Store initial queue size
@@ -1600,7 +1609,10 @@ async def start_handler(event):
         "Welcome! Here are the available commands:\n\n"
         "📥 /leech - Download videos from MPD URLs\n"
         "   Format: /leech\n"
-        "   `<mpd_url>|<key>|<name>`\n\n"
+        "   `<mpd_url>|<key>|<name>` or `<direct_url>|<name>`\n\n"
+        "📥 /mplink - Quick leech for direct `.mp4` (or any direct file)\n"
+        "   Format: /mplink\n"
+        "   `<direct_url>|<name>`\n\n"
         "📋 /loadjson - Load JSON data for batch processing\n"
         "⚡ /processjson [range] - Process JSON data\n"
         "   Examples: /processjson all, /processjson 1-50\n\n"
@@ -1608,6 +1620,7 @@ async def start_handler(event):
         "🚀 /processbulk - Process multiple JSONs sequentially\n"
         "🧹 /clearbulk - Clear stored bulk JSON data\n\n"
         "📊 /speed - Check download/upload speeds\n"
+        "📊 /status - Live status of your current task\n"
         "🧹 /clearall - Clear all tasks from your queue\n"
         "🗑️ /clear - Complete cleanup (queue + files + data)\n\n"
         "🖼️ /addthumbnail - Add custom thumbnail (send photo)\n"
@@ -1624,7 +1637,7 @@ async def start_handler(event):
         event=event
     )
 
-@client.on(events.NewMessage(pattern=r'^/leech'))
+@client.on(events.NewMessage(pattern=r'^/(leech|mplink)'))
 async def leech_handler(event):
     sender = await event.get_sender()
     raw_message = event.raw_text  # Log the raw message text
@@ -1643,14 +1656,15 @@ async def leech_handler(event):
     user_queue, user_states, user_lock = get_user_resources(sender.id)
 
     try:
-        # Extract the message content after the /leech command
+        # Extract the message content after the command
         message_content = event.raw_text.split('\n', 1)
         if len(message_content) < 2:
-            await send_message_with_flood_control(
-                entity=event.chat_id,
-                message="Format: /leech\n<mpd_url>|<key>|<name>\n<mpd_url>|<key>|<name>...\nOr use /loadjson for batch processing",
-                event=event
-            )
+            cmd = event.pattern_match.group(1)
+            if cmd == 'mplink':
+                usage = "Format: /mplink\n<direct_url>|<name>\n(direct .mp4 or any direct file)"
+            else:
+                usage = "Format: /leech\n<mpd_url>|<key>|<name>\n<direct_url>|<name>\n...\nOr use /loadjson for batch processing"
+            await send_message_with_flood_control(entity=event.chat_id, message=usage, event=event)
             return
 
         # Split the remaining content into individual lines (each line is a link)
@@ -1661,34 +1675,42 @@ async def leech_handler(event):
         tasks_to_add = []
         invalid_links = []
 
-        # Process regular format only
+        # Process both DRM and direct .mp4 links
         for i, link in enumerate(links, 1):
             args = link.split('|')
-            if len(args) != 3:
-                invalid_links.append(f"Link {i}: Invalid format (expected mpd_url|key|name)")
-                continue
-
-            mpd_url, key, name = [arg.strip() for arg in args]
-            logging.info(f"Processing link {i}: {mpd_url} | {key} | {name}")
-
-            # Validate MPD URL
-            if not mpd_url.startswith("http") or ".mpd" not in mpd_url:
-                invalid_links.append(f"Link {i}: Invalid MPD URL ({mpd_url})")
-                continue
-
-            # Validate key format
-            if ":" not in key or len(key.split(":")) != 2:
-                invalid_links.append(f"Link {i}: Key must be in KID:KEY format ({key})")
-                continue
-
-            # If validation passes, add the task to the list
-            tasks_to_add.append({
-                'type': 'drm',
-                'mpd_url': mpd_url,
-                'key': key,
-                'name': name,
-                'sender': sender
-            })
+            # Support two formats:
+            # 1) mpd_url|key|name  (DRM)
+            # 2) direct_url|name   (Direct .mp4 or any file)
+            if len(args) == 3:
+                mpd_url, key, name = [arg.strip() for arg in args]
+                logging.info(f"Processing DRM link {i}: {mpd_url} | {key} | {name}")
+                if not mpd_url.startswith("http") or ".mpd" not in mpd_url:
+                    invalid_links.append(f"Link {i}: Invalid MPD URL ({mpd_url})")
+                    continue
+                if ":" not in key or len(key.split(":")) != 2:
+                    invalid_links.append(f"Link {i}: Key must be in KID:KEY format ({key})")
+                    continue
+                tasks_to_add.append({
+                    'type': 'drm',
+                    'mpd_url': mpd_url,
+                    'key': key,
+                    'name': name,
+                    'sender': sender
+                })
+            elif len(args) == 2:
+                direct_url, name = [arg.strip() for arg in args]
+                logging.info(f"Processing Direct link {i}: {direct_url} | {name}")
+                if not direct_url.startswith("http"):
+                    invalid_links.append(f"Link {i}: Invalid URL ({direct_url})")
+                    continue
+                tasks_to_add.append({
+                    'type': 'direct',
+                    'url': direct_url,
+                    'name': name,
+                    'sender': sender
+                })
+            else:
+                invalid_links.append(f"Link {i}: Invalid format (expected mpd_url|key|name OR direct_url|name)")
 
         # If there are invalid links, notify the user
         if invalid_links:
@@ -1743,9 +1765,10 @@ async def leech_handler(event):
             )
 
             # Start the queue processor if it's not already running for this user
-            if not user_states.get(sender.id, False):
+            if not user_states.get(sender.id, False) and (not user_active_tasks.get(sender.id) or user_active_tasks[sender.id].done()):
                 logging.info(f"Starting queue processor for user {sender.id} from /leech handler")
                 bot = MPDLeechBot(sender.id)
+                user_bot_instances[sender.id] = bot
                 user_active_tasks[sender.id] = asyncio.create_task(bot.process_queue(event))
 
     except Exception as e:
@@ -1790,6 +1813,7 @@ async def clearall_handler(event):
         cleared_count = len(user_queue)
         user_queue.clear()
         user_states[sender.id] = False
+        user_bot_instances[sender.id] = None
         logging.info(f"Cleared {cleared_count} tasks from queue for user {sender.id}")
 
     await send_message_with_flood_control(
@@ -1833,6 +1857,7 @@ async def clear_handler(event):
             cleared_count = len(user_queue)
             user_queue.clear()
             user_states[sender.id] = False
+            user_bot_instances[sender.id] = None
             logging.info(f"Cleared {cleared_count} tasks from queue for user {sender.id}")
 
         # Clear JSON data
@@ -1890,7 +1915,7 @@ async def loadjson_handler(event):
 
     await send_message_with_flood_control(
         entity=event.chat_id,
-        message="📥 Ready to receive JSON data!\n\nYou can:\n1. Upload a .json file\n2. Send JSON text directly\n\nExpected format:\n```json\n[\n  {\n    \"name\": \"Video Name\",\n    \"type\": \"drm\",\n    \"mpd_url\": \"https://example.com/manifest.mpd\",\n    \"keys\": [\"kid:key\"]\n  },\n  {\n    \"name\": \"Direct Video\",\n    \"type\": \"direct\",\n    \"url\": \"https://example.com/video.mp4\"\n  }\n]\n```\n\nAfter sending JSON data, use /processjson to start processing all videos!",
+        message="📥 Ready to receive JSON data!\n\nYou can:\n1. Upload a .json file\n2. Send JSON text directly\n\nExpected format:\n```json\n[\n  {\n    \"name\": \"Video Name\",\n    \"type\": \"drm\",\n    \"mpd_url\": \"https://example.com/manifest.mpd\",\n    \"keys\": [\"kid:key\"]\n  },\n  {\n    \"name\": \"Direct Video\",\n    \"type\": \"direct\",\n    \"url\": \"https://example.com/video.mp4\"\n  }\n]\n```\n\nAfter sending JSON data, use /processjson to start processing all videos!\n\nDirect format also supported in /leech: <direct_url>|<name>",
         event=event
     )
 
@@ -2159,8 +2184,9 @@ async def processjson_handler(event):
 
             queue_message = f"📋 Selected Range: {range_message}\n"
             queue_message += f"Added {len(tasks_to_add)} task(s) from JSON to your queue:\n"
+            first_name = tasks_to_add[0]['name']
             task_type_emoji = "🔐" if tasks_to_add[0]['type'] == 'drm' else "📥"
-            queue_message += f"Task 1: {task_type_emoji} {filename}.mp4\n" # Use JSON name as filename
+            queue_message += f"Task 1: {task_type_emoji} {first_name}.mp4\n"
 
             if user_states.get(sender.id, False):
                 queue_message += "\nA task is currently being processed. Your tasks will start soon… ⏳"
@@ -2172,9 +2198,10 @@ async def processjson_handler(event):
             )
 
             # Start queue processor if not running
-            if not user_states.get(sender.id, False):
+            if not user_states.get(sender.id, False) and (not user_active_tasks.get(sender.id) or user_active_tasks[sender.id].done()):
                 logging.info(f"Starting queue processor for user {sender.id} from /processjson handler")
                 bot = MPDLeechBot(sender.id)
+                user_bot_instances[sender.id] = bot
                 user_active_tasks[sender.id] = asyncio.create_task(bot.process_queue(event))
 
         # Don't clear JSON data after processing - keep it for future range selections
@@ -2348,22 +2375,20 @@ async def perform_internet_speed_test():
     """Perform live internet speed test for both download and upload"""
     # Download test URLs
     download_urls = [
-        "https://speed.cloudflare.com/__down?bytes=25000000",  # 25MB from Cloudflare
-        "https://www.gstatic.com/hostedimg/50MB.bin_url",  # Google's test file
-        "https://ash-speed.hetzner.com/100MB.bin",  # Hetzner 100MB test
-        "https://speedtest.selectel.com/100MB.zip",  # Selectel 100MB test
-        "http://212.183.159.230/100MB.zip",  # Generic speed test file
+        "https://speed.cloudflare.com/__down?bytes=100000000",  # 100MB from Cloudflare
+        "https://speed.hetzner.de/100MB.bin",  # Hetzner 100MB test
+        "https://proof.ovh.net/files/100Mb.dat",  # OVH test file
+        "https://speedtest.tele2.net/100MB.zip",  # Tele2 100MB test
     ]
 
     # Upload test URLs (these accept POST requests for upload testing)
     upload_urls = [
         "https://httpbin.org/post",  # httpbin accepts POST data
         "https://speed.cloudflare.com/__up",  # Cloudflare upload test
-        "https://www.googleapis.com/upload/storage/v1/b/test/o",  # Google upload test
     ]
 
-    test_size = 25 * 1024 * 1024  # 25MB test
-    max_test_time = 15  # Maximum 15 seconds for speed test
+    test_size = 150 * 1024 * 1024  # up to 150MB to better utilize 1Gbps
+    max_test_time = 8  # tighter but enough to sample
 
     # Test download speed
     download_speed = None
@@ -2386,12 +2411,12 @@ async def perform_internet_speed_test():
                 downloaded_bytes = 0
 
                 async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url, headers=headers) as response:
+                    async with session.get(url, headers=headers, allow_redirects=True) as response:
                         if response.status != 200:
                             continue
 
                         # Read data in chunks and measure speed
-                        async for chunk in response.content.iter_chunked(1024 * 1024):  # 1MB chunks
+                        async for chunk in response.content.iter_chunked(4 * 1024 * 1024):  # 4MB chunks for higher throughput
                             downloaded_bytes += len(chunk)
                             elapsed = time.time() - start_time
 
@@ -2465,7 +2490,7 @@ async def perform_internet_speed_test():
                 start_time = time.time()
 
                 async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.post(url, data=upload_data, headers=headers) as response:
+                    async with session.post(url, data=upload_data, headers=headers, allow_redirects=True) as response:
                         # Don't care about response status for upload test, just measure upload time
                         elapsed = time.time() - start_time
                         
@@ -2505,10 +2530,10 @@ async def perform_internet_speed_test():
 
     return download_speed, download_bytes, download_time, upload_speed, upload_bytes, upload_time
 
-@client.on(events.NewMessage(pattern=r'^/speed'))
+@client.on(events.NewMessage(pattern=r'^/(speed|status)$'))
 async def speed_handler(event):
     sender = await event.get_sender()
-    logging.info(f"Received /speed command from user {sender.id}")
+    logging.info(f"Received /speed or /status command from user {sender.id}")
 
     if sender.id not in authorized_users:
         await send_message_with_flood_control(
@@ -2648,36 +2673,44 @@ async def speed_handler(event):
     if user_states.get(sender.id, False):
         # Try to get current transfer speed from active task
         try:
-            if sender.id in user_active_tasks and user_active_tasks[sender.id]:
-                temp_bot = MPDLeechBot(sender.id)
+            bot_inst = user_bot_instances.get(sender.id)
+            if bot_inst:
+                stage = bot_inst.progress_state.get('stage', 'Initializing')
+                current_speed = bot_inst.progress_state.get('speed', 0)
+                percent = bot_inst.progress_state.get('percent', 0)
+                done = bot_inst.progress_state.get('done_size', 0)
+                total = bot_inst.progress_state.get('total_size', 0)
+                filename = getattr(bot_inst, 'current_filename', 'Current Task')
 
-                if hasattr(temp_bot, 'progress_state') and temp_bot.progress_state.get('stage') not in ['Completed', 'Initializing']:
-                    current_speed = temp_bot.progress_state.get('speed', 0)
-                    stage = temp_bot.progress_state.get('stage', 'Unknown')
-                    percent = temp_bot.progress_state.get('percent', 0)
-
-                    if stage in ['Downloading']:
-                        speed_type = "📥 Active Download"
-                        speed_emoji = "⬇️"
-                    elif stage in ['Uploading']:
-                        speed_type = "📤 Active Upload"
-                        speed_emoji = "⬆️"
-                    else:
-                        speed_type = f"🔄 {stage}"
-                        speed_emoji = "⚡"
-
-                    speed_message += (
-                        f"\n\n📊 **Current Task Speed** 📊\n"
-                        f"{speed_emoji} **{speed_type}:** {format_size(current_speed)}/s\n"
-                        f"📈 **Progress:** {percent:.1f}%\n"
-                        f"🔄 **Stage:** {stage}"
-                    )
+                if stage in ['Downloading']:
+                    speed_type = "📥 Active Download"
+                    speed_emoji = "⬇️"
+                elif stage in ['Uploading']:
+                    speed_type = "📤 Active Upload"
+                    speed_emoji = "⬆️"
+                elif stage == 'Merging':
+                    speed_type = "🎬 Merging"
+                    speed_emoji = "🎬"
+                elif stage == 'Decrypting':
+                    speed_type = "🔐 Decrypting"
+                    speed_emoji = "🔐"
                 else:
-                    speed_message += (
-                        f"\n\n📊 **Current Task** 📊\n"
-                        f"🔄 Task is running (Processing/Merging)\n"
-                        f"💡 Transfer speed will show during download/upload"
-                    )
+                    speed_type = f"🔄 {stage}"
+                    speed_emoji = "⚡"
+
+                speed_message += (
+                    f"\n\n📊 **Current Task** 📊\n"
+                    f"📄 {filename}\n"
+                    f"{speed_emoji} **{speed_type}:** {format_size(current_speed)}/s\n"
+                    f"📈 **Progress:** {percent:.1f}%\n"
+                    f"📦 {format_size(done)} / {format_size(total)}"
+                )
+            else:
+                speed_message += (
+                    f"\n\n📊 **Current Task** 📊\n"
+                    f"🔄 Task is running (Processing/Merging)\n"
+                    f"💡 Transfer speed will show during download/upload"
+                )
         except Exception as e:
             logging.warning(f"Could not get active task speed: {e}")
 
@@ -2707,7 +2740,7 @@ async def bulk_handler(event):
 
     await send_message_with_flood_control(
         entity=event.chat_id,
-        message="📦 **Bulk JSON Processing** 📦\n\nSend multiple JSON files or JSON text messages. Each JSON will be processed completely before starting the next one.\n\n**Usage:**\n1. Send multiple JSON files/text\n2. Use `/processbulk` to start sequential processing\n3. Use `/clearbulk` to clear stored JSON data\n\n**Example Format:**\n```json\n[\n  {\n    \"name\": \"Video1\",\n    \"type\": \"drm\",\n    \"mpd_url\": \"https://example.com/manifest1.mpd\",\n    \"keys\": [\"kid:key\"]\n  }\n]\n```\n\nReady to receive JSON data! 🚀",
+        message="📦 **Bulk JSON Processing** 📦\n\nSend multiple JSON files or JSON text messages. Each JSON will be processed completely before starting the next one.\n\n**Usage:**\n1. Send multiple JSON files/text\n2. Use `/processbulk` to start sequential processing\n3. Use `/clearbulk` to clear stored JSON data\n\n**Example Format:**\n```json\n[\n  {\n    \"name\": \"Video1\",\n    \"type\": \"drm\",\n    \"mpd_url\": \"https://example.com/manifest1.mpd\",\n    \"keys\": [\"kid:key\"]\n  },\n  {\n    \"name\": \"MyMovie\",\n    \"type\": \"direct\",\n    \"url\": \"https://example.com/mymovie.mp4\"\n  }\n]\n```\n\nReady to receive JSON data! 🚀",
         event=event
     )
 
@@ -2756,11 +2789,7 @@ async def processbulk_handler(event):
     for json_index, json_data in enumerate(bulk_data_list, 1):
         try:
             # Notify user about current JSON
-            await send_message_with_flood_control(
-                entity=event.chat_id,
-                message=f"📋 **JSON {json_index}/{total_jsons}** - Starting processing of {len(json_data)} items",
-                event=event
-            )
+            await send_message_with_flood_control(entity=event.chat_id, message=f"📋 **JSON {json_index}/{total_jsons}** - Starting processing of {len(json_data)} items", event=event)
 
             # Add all tasks from current JSON to queue
             tasks_to_add = []
@@ -2807,8 +2836,9 @@ async def processbulk_handler(event):
                     user_queue.append(task)
 
             # Start processing this JSON and wait for completion
-            if not user_states.get(sender.id, False):
+            if not user_states.get(sender.id, False) and (not user_active_tasks.get(sender.id) or user_active_tasks[sender.id].done()):
                 bot = MPDLeechBot(sender.id)
+                user_bot_instances[sender.id] = bot
                 user_active_tasks[sender.id] = asyncio.create_task(bot.process_queue(event))
 
             # Wait for this JSON to complete before starting next
@@ -2816,19 +2846,11 @@ async def processbulk_handler(event):
                 await asyncio.sleep(5)
 
             # Send completion message for this JSON
-            await send_message_with_flood_control(
-                entity=event.chat_id,
-                message=f"✅ **JSON {json_index}/{total_jsons} Completed!** All {len(tasks_to_add)} tasks processed.\n\n{'🎉 All JSONs completed!' if json_index == total_jsons else f'⏭️ Moving to JSON {json_index + 1}/{total_jsons}...'}",
-                event=event
-            )
+            await send_message_with_flood_control(entity=event.chat_id, message=f"✅ **JSON {json_index}/{total_jsons} Completed!** All {len(tasks_to_add)} tasks processed.\n\n{'🎉 All JSONs completed!' if json_index == total_jsons else f'⏭️ Moving to JSON {json_index + 1}/{total_jsons}...'}", event=event)
 
         except Exception as e:
             logging.error(f"Error processing JSON {json_index} for user {sender.id}: {e}")
-            await send_message_with_flood_control(
-                entity=event.chat_id,
-                message=f"❌ **JSON {json_index}/{total_jsons} Failed:** {str(e)}\n\n{'Moving to next JSON...' if json_index < total_jsons else 'Bulk processing completed with errors.'}",
-                event=event
-            )
+            await send_message_with_flood_control(entity=event.chat_id, message=f"❌ **JSON {json_index}/{total_jsons} Failed:** {str(e)}\n\n{'Moving to next JSON...' if json_index < total_jsons else 'Bulk processing completed with errors.'}", event=event)
 
     # Final completion message
     await send_message_with_flood_control(
@@ -2869,16 +2891,19 @@ async def clearbulk_handler(event):
 
 # Main function to start the bot
 async def main():
-    await client.start(bot_token=BOT_TOKEN)
-    logging.info("Bot started successfully!")
+    while True:
+        try:
+            await client.start(bot_token=BOT_TOKEN)
+            logging.info("Bot started successfully!")
 
-    # Get bot info
-    me = await client.get_me()
-    logging.info(f"Bot username: @{me.username}")
-    logging.info(f"Bot ID: {me.id}")
+            me = await client.get_me()
+            logging.info(f"Bot username: @{me.username}")
+            logging.info(f"Bot ID: {me.id}")
 
-    # Run until disconnected
-    await client.run_until_disconnected()
+            await client.run_until_disconnected()
+        except Exception as e:
+            logging.error(f"Bot crashed with error: {e}\nRestarting in 5 seconds...")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
     asyncio.run(main())
