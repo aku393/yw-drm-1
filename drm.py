@@ -1122,7 +1122,7 @@ class MPDLeechBot:
                     logging.info(f"Chunk {i+1}: file_id={file_id}, chunk_size={chunk_size}, part_size={part_size}, total_parts={total_parts}")
                     if total_parts <= 0:
                         raise ValueError(f"Invalid total_parts for chunk {i+1}: {total_parts}")
-                    semaphore = asyncio.Semaphore(20)  # Maximum concurrent uploads
+                    semaphore = asyncio.Semaphore(2)  # Maximum concurrent uploads
                     logging.info(f"Starting parallel upload for chunk {i+1}, size: {chunk_size}, total parts: {total_parts}, file_id: {file_id}")
 
                     async def update_progress():
@@ -1267,7 +1267,7 @@ class MPDLeechBot:
                 logging.info(f"Single file: file_id={file_id}, file_size={file_size}, part_size={part_size}, total_parts={total_parts}")
                 if total_parts <= 0:
                     raise ValueError(f"Invalid total_parts for single file: {total_parts}")
-                semaphore = asyncio.Semaphore(20)  # Maximum concurrent uploads
+                semaphore = asyncio.Semaphore(2)  # Maximum concurrent uploads
                 logging.info(f"Starting parallel upload for file, size: {file_size}, total parts: {total_parts}, file_id: {file_id}")
 
                 async def update_progress():
