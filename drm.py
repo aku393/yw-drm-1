@@ -690,6 +690,8 @@ class MPDLeechBot:
                             f.write(chunk)
                             downloaded += len(chunk)
                             progress['done_size'] += len(chunk)
+                            # Update byte-based progress frequently for MPD
+                            self.progress_state['done_size'] = progress['done_size']
                     logging.info(f"Fetched segment: {url}, size={downloaded} bytes")
                     progress['completed'] += 1
                     return downloaded
@@ -757,16 +759,56 @@ class MPDLeechBot:
         for i in range(num_chunks):
             if cancel_event and cancel_event.is_set():
                 raise asyncio.CancelledError()
-            if progress_cb:
-                try:
-                    await progress_cb(i, num_chunks)
-                except Exception:
-                    pass
             output_file = f"{base_name}_{str(i+1).zfill(3)}{ext}"
             start_time = i * chunk_duration
-            cmd = ['ffmpeg', '-i', input_file, '-ss', str(start_time), '-t', str(chunk_duration), '-c', 'copy', output_file, '-y']
+            # Use -v quiet -stats to emit periodic progress lines
+            cmd = [
+                'ffmpeg',
+                '-hide_banner',
+                '-v', 'quiet',
+                '-stats',
+                '-ss', str(start_time),
+                '-t', str(chunk_duration),
+                '-i', input_file,
+                '-c', 'copy',
+                output_file,
+                '-y'
+            ]
             logging.info(f"Splitting: {' '.join(cmd)}")
-            process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            process = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+
+            # Read stderr progressively to compute in-part progress percent
+            while True:
+                if cancel_event and cancel_event.is_set():
+                    process.kill()
+                    raise asyncio.CancelledError()
+                line = await process.stderr.readline()
+                if not line:
+                    break
+                text = line.decode(errors='ignore').strip()
+                # Example stats lines include: time=00:00:12.34
+                if 'time=' in text and progress_cb:
+                    try:
+                        t_str = text.split('time=')[-1].split(' ')[0]
+                        h, m, s = 0, 0, 0.0
+                        parts = t_str.split(':')
+                        if len(parts) == 3:
+                            h = int(parts[0])
+                            m = int(parts[1])
+                            s = float(parts[2])
+                        elif len(parts) == 2:
+                            m = int(parts[0])
+                            s = float(parts[1])
+                        else:
+                            s = float(parts[0])
+                        elapsed = h * 3600 + m * 60 + s
+                        part_percent = min(100.0, max(0.0, (elapsed / chunk_duration) * 100 if chunk_duration > 0 else 0))
+                        await progress_cb(i, num_chunks, part_percent)
+                    except Exception:
+                        pass
+
             stdout, stderr = await process.communicate()
             if process.returncode == 0:
                 chunks.append(output_file)
@@ -776,7 +818,7 @@ class MPDLeechBot:
                 raise Exception(f"Split failed: {stderr.decode()}")
             if progress_cb:
                 try:
-                    await progress_cb(i+1, num_chunks)
+                    await progress_cb(i+1, num_chunks, 100.0)
                 except Exception:
                     pass
         return chunks
@@ -925,6 +967,27 @@ class MPDLeechBot:
             total_size = 0
             max_total_size_est = 0  # To stabilize the total size estimate
 
+            # Try HEAD requests to estimate total sizes for accurate progress
+            async def head_size(url, range_header=None):
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        headers_local = headers.copy()
+                        headers_local['Accept'] = 'video/mp4,application/mp4,*/*'
+                        if range_header:
+                            headers_local['Range'] = range_header
+                        async with session.head(url, headers=headers_local, allow_redirects=True) as resp:
+                            cl = resp.headers.get('Content-Length')
+                            return int(cl) if cl else 0
+                except Exception:
+                    return 0
+
+            est_sizes = await asyncio.gather(*[
+                head_size(u, r) for (u, r) in (video_segments + audio_segments)
+            ])
+            estimated_total_bytes = sum(est_sizes) if any(est_sizes) else 0
+            if estimated_total_bytes > 0:
+                self.progress_state['total_size'] = estimated_total_bytes
+
             last_update_time = 0  # For debouncing
             async def update_progress(filename, user, user_id):
                 nonlocal max_total_size_est, last_update_time, status_msg
@@ -939,10 +1002,15 @@ class MPDLeechBot:
                         self.progress_state['elapsed'] = current_time - self.progress_state['start_time']
                         self.progress_state['speed'] = self.progress_state['done_size'] / self.progress_state['elapsed'] if self.progress_state['elapsed'] > 0 else 0
                         if self.progress_state['stage'] == "Downloading":
-                            total_size_est = self.progress_state['done_size'] * total_segments / max(progress['completed'], 1)
-                            max_total_size_est = max(max_total_size_est, total_size_est)
-                            self.progress_state['total_size'] = max_total_size_est
-                            self.progress_state['percent'] = progress['completed'] * 100 / total_segments
+                            # Prefer byte-accurate progress if we could estimate sizes
+                            if estimated_total_bytes > 0:
+                                self.progress_state['percent'] = (self.progress_state['done_size'] / estimated_total_bytes) * 100
+                                self.progress_state['total_size'] = estimated_total_bytes
+                            else:
+                                total_size_est = self.progress_state['done_size'] * total_segments / max(progress['completed'], 1)
+                                max_total_size_est = max(max_total_size_est, total_size_est)
+                                self.progress_state['total_size'] = max_total_size_est
+                                self.progress_state['percent'] = progress['completed'] * 100 / total_segments
                         display = progress_display(
                             self.progress_state['stage'],
                             self.progress_state['percent'],
@@ -1189,13 +1257,16 @@ class MPDLeechBot:
                     self.has_notified_split = True
                     logging.info(f"Notified user about splitting file: {filepath}")
                 # Splitting progress callback
-                async def splitting_progress(current_index, total_parts):
-                    # Update stage and percent for splitting
+                async def splitting_progress(current_index, total_parts, part_percent):
+                    # current_index is 0..total_parts during progress lines, total at completion
                     self.progress_state['stage'] = "Splitting"
                     self.progress_state['total_size'] = total_parts
+                    # Map done_size to bytes-like semantics to reuse bar: done parts out of total
                     self.progress_state['done_size'] = current_index
-                    percent = (current_index / total_parts * 100) if total_parts else 0
-                    self.progress_state['percent'] = percent
+                    overall_percent = 0.0
+                    if total_parts > 0:
+                        overall_percent = ((current_index + (part_percent / 100.0)) / total_parts) * 100.0
+                    self.progress_state['percent'] = min(100.0, max(0.0, overall_percent))
                     display = progress_display(
                         self.progress_state['stage'],
                         self.progress_state['percent'],
@@ -1205,7 +1276,7 @@ class MPDLeechBot:
                         time.time() - self.progress_state['start_time'],
                         sender.first_name,
                         sender.id,
-                        os.path.basename(filepath)
+                        f"{os.path.basename(filepath)} (Part {min(current_index+1, total_parts)}/{total_parts})"
                     )
                     nonlocal status_msg
                     async with self.update_lock:
