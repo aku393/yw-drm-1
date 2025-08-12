@@ -495,6 +495,7 @@ class MPDLeechBot:
         self.update_lock = asyncio.Lock()  # Lock to prevent concurrent updates
         self.is_downloading = False  # Flag to prevent overlapping downloads in the same instance
         self.current_filename = None  # Track current file name for /status
+        self.abort_event = asyncio.Event()  # Signal to skip/cancel current task
         # Progress tracking state
         self.progress_state = {
             'stage': 'Initializing',
@@ -539,6 +540,36 @@ class MPDLeechBot:
             self.progress_state['total_size'] = 0
             self.progress_state['speed'] = 0
             self.progress_state['elapsed'] = 0
+            # Background progress updater
+            last_update_time = 0
+            async def update_progress_direct():
+                nonlocal status_msg, last_update_time
+                while self.progress_state['stage'] == "Downloading" and not self.abort_event.is_set():
+                    current_time = time.time()
+                    if current_time - last_update_time < 3:
+                        await asyncio.sleep(0.2)
+                        continue
+                    self.progress_state['elapsed'] = current_time - self.progress_state['start_time']
+                    self.progress_state['speed'] = (self.progress_state['done_size'] / self.progress_state['elapsed']) if self.progress_state['elapsed'] > 0 else 0
+                    display = progress_display(
+                        self.progress_state['stage'],
+                        self.progress_state['percent'],
+                        self.progress_state['done_size'],
+                        self.progress_state['total_size'],
+                        self.progress_state['speed'],
+                        self.progress_state['elapsed'],
+                        sender.first_name,
+                        sender.id,
+                        name + ".mp4"
+                    )
+                    async with self.update_lock:
+                        status_msg = await send_message_with_flood_control(
+                            entity=event.chat_id,
+                            message=display,
+                            edit_message=status_msg
+                        )
+                        last_update_time = current_time
+                    await asyncio.sleep(3)
 
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -561,8 +592,13 @@ class MPDLeechBot:
                     self.progress_state['total_size'] = total_size
                     downloaded = 0
 
+                    # Start progress updater task
+                    progress_task = asyncio.create_task(update_progress_direct())
+
                     with open(output_file, 'wb', buffering=0) as f:
                         async for chunk in response.content.iter_chunked(4 * 1024 * 1024):  # 4MB chunks
+                            if self.abort_event.is_set():
+                                raise asyncio.CancelledError()
                             f.write(chunk)
                             downloaded += len(chunk)
                             self.progress_state['done_size'] = downloaded
@@ -570,6 +606,13 @@ class MPDLeechBot:
                             elapsed = time.time() - self.progress_state['start_time']
                             self.progress_state['speed'] = downloaded / elapsed if elapsed > 0 else 0
                             self.progress_state['elapsed'] = elapsed
+
+                    # Stop progress updater
+                    progress_task.cancel()
+                    try:
+                        await progress_task
+                    except:
+                        pass
 
             # Get video duration using ffprobe
             try:
@@ -639,7 +682,9 @@ class MPDLeechBot:
                     total_size = int(response.headers.get('Content-Length', 0))
                     downloaded = 0
                     with open(output_file, 'wb') as f:
-                        async for chunk in response.content.iter_chunked(1024 * 1024):
+                        async for chunk in response.content.iter_chunked(4 * 1024 * 1024):
+                            if self.abort_event.is_set():
+                                raise asyncio.CancelledError()
                             f.write(chunk)
                             downloaded += len(chunk)
                             progress['done_size'] += len(chunk)
@@ -1434,6 +1479,9 @@ class MPDLeechBot:
         filepath = None
         status_msg = None
         try:
+            # Reset abort flag for this task
+            if self.abort_event.is_set():
+                self.abort_event.clear()
             task_type = task_data.get('type', 'drm')
             name = task_data['name']
             self.current_filename = f"{name}.mp4"
@@ -1475,6 +1523,18 @@ class MPDLeechBot:
 
             return True, None  # Success
 
+        except asyncio.CancelledError:
+            logging.info(f"Task was skipped/cancelled by user for {task_data.get('name', 'unknown')}")
+            # Inform user of skip
+            try:
+                await send_message_with_flood_control(
+                    entity=event.chat_id,
+                    message=f"⏭️ Skipped: {task_data.get('name', 'unknown')}.mp4",
+                    event=event
+                )
+            except Exception:
+                pass
+            return False, "Skipped by user"
         except Exception as e:
             logging.error(f"Task processing failed for {task_data.get('name', 'unknown')}: {str(e)}\n{traceback.format_exc()}")
 
@@ -1787,6 +1847,12 @@ async def leech_handler(event):
                 user_queue.append(task)
                 position = len(user_queue)
                 logging.info(f"Task added to queue for user {sender.id}: {task['name']}.mp4, Position: {position}/{len(user_queue)}")
+            # Reset abort flag if an instance exists
+            if sender.id in user_bot_instances and user_bot_instances[sender.id]:
+                try:
+                    user_bot_instances[sender.id].abort_event.clear()
+                except Exception:
+                    pass
 
             # Notify user about the tasks added to the queue
             if len(tasks_to_add) <= 10:
@@ -1850,6 +1916,10 @@ async def clearall_handler(event):
         active_task = user_active_tasks[sender.id]
         if not active_task.done():
             logging.info(f"Cancelling active task for user {sender.id}")
+            # Signal skip/abort if instance exists
+            bot_inst = user_bot_instances.get(sender.id)
+            if bot_inst:
+                bot_inst.abort_event.set()
             active_task.cancel()
             try:
                 await active_task
@@ -1893,6 +1963,9 @@ async def clear_handler(event):
             active_task = user_active_tasks[sender.id]
             if not active_task.done():
                 logging.info(f"Cancelling active task for user {sender.id}")
+                bot_inst = user_bot_instances.get(sender.id)
+                if bot_inst:
+                    bot_inst.abort_event.set()
                 active_task.cancel()
                 try:
                     await active_task
@@ -2205,6 +2278,12 @@ async def processjson_handler(event):
                 filename = task['name']
                 user_queue.append(task)
                 logging.info(f"JSON task added to queue for user {sender.id}: {task['name']}.mp4")
+            # Reset abort flag if an instance exists
+            if sender.id in user_bot_instances and user_bot_instances[sender.id]:
+                try:
+                    user_bot_instances[sender.id].abort_event.clear()
+                except Exception:
+                    pass
 
             # queue_message = f"📋 **Selected Range: {start_idx + 1}-{end_idx}**\n"
             # queue_message += f"Added {len(tasks_to_add)} task(s) from JSON to your queue:\n"
@@ -2748,6 +2827,7 @@ async def speed_handler(event):
                 done = bot_inst.progress_state.get('done_size', 0)
                 total = bot_inst.progress_state.get('total_size', 0)
                 filename = getattr(bot_inst, 'current_filename', 'Current Task')
+                elapsed = bot_inst.progress_state.get('elapsed', 0)
 
                 if stage in ['Downloading']:
                     speed_type = "📥 Active Download"
@@ -2770,7 +2850,8 @@ async def speed_handler(event):
                     f"📄 {filename}\n"
                     f"{speed_emoji} **{speed_type}:** {format_size(current_speed)}/s\n"
                     f"📈 **Progress:** {percent:.1f}%\n"
-                    f"📦 {format_size(done)} / {format_size(total)}"
+                    f"📦 {format_size(done)} / {format_size(total)}\n"
+                    f"⏱️ {format_time(elapsed)}"
                 )
             else:
                 speed_message += (
@@ -2955,6 +3036,57 @@ async def clearbulk_handler(event):
                 message="ℹ️ No bulk JSON data found to clear.",
                 event=event
             )
+
+@client.on(events.NewMessage(pattern=r'^/(skip)(?:\s+(\d+)(?:-(\d+))?)?$'))
+async def skip_handler(event):
+    sender = await event.get_sender()
+    if sender.id not in authorized_users:
+        return
+
+    user_queue, user_states, user_lock = get_user_resources(sender.id)
+
+    try:
+        start = event.pattern_match.group(2)
+        end = event.pattern_match.group(3)
+
+        if not start:
+            # Skip current task
+            if sender.id in user_active_tasks and user_active_tasks[sender.id] and not user_active_tasks[sender.id].done():
+                bot_inst = user_bot_instances.get(sender.id)
+                if bot_inst:
+                    bot_inst.abort_event.set()
+                user_active_tasks[sender.id].cancel()
+                await send_message_with_flood_control(entity=event.chat_id, message="⏭️ Skipping current task...", event=event)
+            else:
+                await send_message_with_flood_control(entity=event.chat_id, message="ℹ️ No active task to skip.", event=event)
+            return
+
+        # Skip a range or single index from the queue (1-based positions relative to queue head)
+        start_idx = int(start)
+        end_idx = int(end) if end else start_idx
+        if start_idx <= 0 or end_idx < start_idx:
+            await send_message_with_flood_control(entity=event.chat_id, message="❌ Invalid range for /skip. Use /skip or /skip 3-5", event=event)
+            return
+
+        removed = []
+        async with user_lock:
+            # Convert to 0-based indices
+            new_queue = []
+            for pos, task in enumerate(list(user_queue), start=1):
+                if start_idx <= pos <= end_idx:
+                    removed.append(task.get('name', 'unknown'))
+                else:
+                    new_queue.append(task)
+            user_queue.clear()
+            user_queue.extend(new_queue)
+
+        if removed:
+            await send_message_with_flood_control(entity=event.chat_id, message=f"🗑️ Skipped tasks: {', '.join(removed)}", event=event)
+        else:
+            await send_message_with_flood_control(entity=event.chat_id, message="ℹ️ No tasks matched the skip range.", event=event)
+    except Exception as e:
+        logging.error(f"/skip error for user {sender.id}: {e}")
+        await send_message_with_flood_control(entity=event.chat_id, message=f"❌ Error processing /skip: {str(e)}", event=event)
 
 # Main function to start the bot
 async def main():
