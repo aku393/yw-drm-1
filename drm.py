@@ -23,6 +23,7 @@ import random  # For generating unique file IDs
 import mmap  # For zero-copy file part reads to speed up uploads
 import re
 import sys
+from urllib.parse import urlparse, unquote
 from telethon.errors.rpcerrorlist import FloodWaitError  # Import FloodWaitError
 from collections import deque  # For task queue
 import json
@@ -282,6 +283,22 @@ def format_time(seconds):
     minutes = minutes % 60
     return f"{hours}h{minutes}m{seconds}s"
 
+def derive_name_from_url(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+        path = unquote(parsed.path or '')
+        filename = os.path.basename(path)
+        if not filename:
+            return "video"
+        # Remove extension if present
+        base, _ext = os.path.splitext(filename)
+        base = base or filename
+        # Sanitize
+        safe = re.sub(r'[^\w\-_. ]+', '_', base)
+        return safe or "video"
+    except Exception:
+        return "video"
+
 def format_completion_message(completed_tasks, failed_tasks, total_initial_tasks):
     """Format completion message in parts if it exceeds Telegram's limit"""
     messages = []
@@ -524,7 +541,13 @@ class MPDLeechBot:
             self.progress_state['elapsed'] = 0
 
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'video/mp4,application/mp4,*/*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Cache-Control': 'no-cache',
+                'Pragma': 'no-cache',
+                'Connection': 'keep-alive',
             }
 
             timeout = aiohttp.ClientTimeout(total=None, sock_connect=60, sock_read=60)
@@ -593,12 +616,12 @@ class MPDLeechBot:
 
     async def fetch_segment(self, url, progress, total_segments, range_header=None, output_file=None):
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Referer': 'https://d4p80xvwvkugy.cloudfront.net/',
-            'Origin': 'https://d4p80xvwvkugy.cloudfront.net',
-            'Accept': '*/*',
-            'Accept-Encoding': 'identity',
-            'Host': 'd4p80xvwvkugy.cloudfront.net',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'video/mp4,application/mp4,*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
             'Connection': 'keep-alive'
         }
         if range_header:
@@ -751,12 +774,12 @@ class MPDLeechBot:
 
             # Stage 1: Fetch MPD with retries and updated headers
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Referer': 'https://d4p80xvwvkugy.cloudfront.net/',
-                'Origin': 'https://d4p80xvwvkugy.cloudfront.net',
-                'Accept': '*/*',
-                'Accept-Encoding': 'identity',
-                'Host': 'd4p80xvwvkugy.cloudfront.net',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'video/mp4,application/mp4,*/*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Cache-Control': 'no-cache',
+                'Pragma': 'no-cache',
                 'Connection': 'keep-alive'
             }
 
@@ -1659,13 +1682,29 @@ async def leech_handler(event):
         # Extract the message content after the command
         message_content = event.raw_text.split('\n', 1)
         if len(message_content) < 2:
-            cmd = event.pattern_match.group(1)
-            if cmd == 'mplink':
-                usage = "Format: /mplink\n<direct_url>|<name>\n(direct .mp4 or any direct file)"
+            # Accept inline usage: /leech <url> [| name]
+            parts = raw_message.split(maxsplit=1)
+            if len(parts) == 2:
+                inline = parts[1].strip()
+                if inline.startswith('http'):
+                    # treat same as one-line payload
+                    message_content = [parts[0], inline]
+                else:
+                    cmd = event.pattern_match.group(1)
+                    if cmd == 'mplink':
+                        usage = "Format: /mplink\n<direct_url>|<name>\n(direct .mp4 or any direct file)"
+                    else:
+                        usage = "Format: /leech\n<mpd_url>|<key>|<name>\n<direct_url>|<name>\n...\nOr use /loadjson for batch processing"
+                    await send_message_with_flood_control(entity=event.chat_id, message=usage, event=event)
+                    return
             else:
-                usage = "Format: /leech\n<mpd_url>|<key>|<name>\n<direct_url>|<name>\n...\nOr use /loadjson for batch processing"
-            await send_message_with_flood_control(entity=event.chat_id, message=usage, event=event)
-            return
+                cmd = event.pattern_match.group(1)
+                if cmd == 'mplink':
+                    usage = "Format: /mplink\n<direct_url>|<name>\n(direct .mp4 or any direct file)"
+                else:
+                    usage = "Format: /leech\n<mpd_url>|<key>|<name>\n<direct_url>|<name>\n...\nOr use /loadjson for batch processing"
+                await send_message_with_flood_control(entity=event.chat_id, message=usage, event=event)
+                return
 
         # Split the remaining content into individual lines (each line is a link)
         links = message_content[1].strip().split('\n')
@@ -1703,6 +1742,17 @@ async def leech_handler(event):
                 if not direct_url.startswith("http"):
                     invalid_links.append(f"Link {i}: Invalid URL ({direct_url})")
                     continue
+                tasks_to_add.append({
+                    'type': 'direct',
+                    'url': direct_url,
+                    'name': name,
+                    'sender': sender
+                })
+            elif len(args) == 1 and args[0].strip().startswith('http'):
+                # Direct URL only, derive name from URL
+                direct_url = args[0].strip()
+                name = derive_name_from_url(direct_url)
+                logging.info(f"Processing Direct link {i}: {direct_url} | (derived name) {name}")
                 tasks_to_add.append({
                     'type': 'direct',
                     'url': direct_url,
@@ -2401,9 +2451,13 @@ async def perform_internet_speed_test():
                 logging.info(f"Testing download speed with URL: {url}")
 
                 headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                    'Accept': '*/*',
-                    'Connection': 'keep-alive'
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'video/mp4,application/mp4,*/*',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Cache-Control': 'no-cache',
+                    'Pragma': 'no-cache',
+                    'Connection': 'keep-alive',
                 }
 
                 timeout = aiohttp.ClientTimeout(total=max_test_time + 5)
@@ -2440,7 +2494,15 @@ async def perform_internet_speed_test():
         if download_speed is None:
             try:
                 url = "https://httpbin.org/bytes/10485760"  # 10MB from httpbin
-                headers = {'User-Agent': 'SpeedTest/1.0'}
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'video/mp4,application/mp4,*/*',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Cache-Control': 'no-cache',
+                    'Pragma': 'no-cache',
+                    'Connection': 'keep-alive',
+                }
                 timeout = aiohttp.ClientTimeout(total=max_test_time)
 
                 start_time = time.time()
@@ -2481,9 +2543,14 @@ async def perform_internet_speed_test():
                 logging.info(f"Testing upload speed with URL: {url}")
 
                 headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                    'Content-Type': 'application/octet-stream',
-                    'Connection': 'keep-alive'
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'video/mp4,application/mp4,*/*',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Cache-Control': 'no-cache',
+                    'Pragma': 'no-cache',
+                    'Connection': 'keep-alive',
+                    'Content-Type': 'application/octet-stream'
                 }
 
                 timeout = aiohttp.ClientTimeout(total=max_test_time + 5)
