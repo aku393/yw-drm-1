@@ -456,6 +456,8 @@ def progress_display(stage, percent, done, total, speed, elapsed, user, user_id,
         "Decrypting": ("🔐", "Decrypting"),
         "Merging": ("🎬", "Merging"),
         "Uploading": ("📤", f"Uploading {percent:.1f}%"),
+        "Splitting": ("✂️", f"Splitting {percent:.1f}%"),
+        "Finalizing": ("🧩", "Finalizing on Telegram"),
         "Completed": ("✅", "Completed"),
         "Initializing": ("🟡", "Initializing"),
     }
@@ -729,7 +731,7 @@ class MPDLeechBot:
             logging.error(f"mp4decrypt error: {str(e)}")
             raise
 
-    async def split_file(self, input_file, max_size_mb=2000):  # Default to 2 GB (2000 MB)
+    async def split_file(self, input_file, max_size_mb=2000, progress_cb=None, cancel_event: asyncio.Event = None):  # Default to 2 GB (2000 MB)
         max_size = max_size_mb * 1024 * 1024
         file_size = os.path.getsize(input_file)
         if file_size <= max_size:
@@ -753,6 +755,13 @@ class MPDLeechBot:
         num_chunks = int(file_size / max_size) + 1
 
         for i in range(num_chunks):
+            if cancel_event and cancel_event.is_set():
+                raise asyncio.CancelledError()
+            if progress_cb:
+                try:
+                    await progress_cb(i, num_chunks)
+                except Exception:
+                    pass
             output_file = f"{base_name}_{str(i+1).zfill(3)}{ext}"
             start_time = i * chunk_duration
             cmd = ['ffmpeg', '-i', input_file, '-ss', str(start_time), '-t', str(chunk_duration), '-c', 'copy', output_file, '-y']
@@ -765,6 +774,11 @@ class MPDLeechBot:
             else:
                 logging.error(f"Split failed: {stderr.decode()}")
                 raise Exception(f"Split failed: {stderr.decode()}")
+            if progress_cb:
+                try:
+                    await progress_cb(i+1, num_chunks)
+                except Exception:
+                    pass
         return chunks
 
     async def download_and_decrypt(self, event, mpd_url, key, name, sender):
@@ -1174,7 +1188,33 @@ class MPDLeechBot:
                     )
                     self.has_notified_split = True
                     logging.info(f"Notified user about splitting file: {filepath}")
-                chunks = await self.split_file(filepath, max_size_mb=max_size_mb)
+                # Splitting progress callback
+                async def splitting_progress(current_index, total_parts):
+                    # Update stage and percent for splitting
+                    self.progress_state['stage'] = "Splitting"
+                    self.progress_state['total_size'] = total_parts
+                    self.progress_state['done_size'] = current_index
+                    percent = (current_index / total_parts * 100) if total_parts else 0
+                    self.progress_state['percent'] = percent
+                    display = progress_display(
+                        self.progress_state['stage'],
+                        self.progress_state['percent'],
+                        self.progress_state['done_size'],
+                        self.progress_state['total_size'],
+                        0,
+                        time.time() - self.progress_state['start_time'],
+                        sender.first_name,
+                        sender.id,
+                        os.path.basename(filepath)
+                    )
+                    nonlocal status_msg
+                    async with self.update_lock:
+                        status_msg = await send_message_with_flood_control(
+                            entity=event.chat_id,
+                            message=display,
+                            edit_message=status_msg
+                        )
+                chunks = await self.split_file(filepath, max_size_mb=max_size_mb, progress_cb=splitting_progress, cancel_event=self.abort_event)
                 for i, chunk in enumerate(chunks):
                     chunk_size = os.path.getsize(chunk)
                     chunk_duration = duration // len(chunks)
@@ -1271,6 +1311,23 @@ class MPDLeechBot:
                             thumbnail_file = temp_thumb_path
                         elif await generate_random_thumbnail(temp_thumb_path):
                             thumbnail_file = temp_thumb_path
+
+                    # Indicate finalizing before send
+                    self.progress_state['stage'] = "Finalizing"
+                    self.progress_state['percent'] = 100.0
+                    display = progress_display(
+                        self.progress_state['stage'],
+                        self.progress_state['percent'],
+                        self.progress_state['done_size'],
+                        self.progress_state['total_size'],
+                        self.progress_state['speed'],
+                        self.progress_state['elapsed'],
+                        sender.first_name,
+                        sender.id,
+                        f"{os.path.basename(chunk)} (Part {i+1})"
+                    )
+                    async with self.update_lock:
+                        status_msg = await send_message_with_flood_control(entity=event.chat_id, message=display, edit_message=status_msg)
 
                     # Send the file directly with thumbnail
                     if thumbnail_file and os.path.exists(thumbnail_file):
@@ -1432,6 +1489,23 @@ class MPDLeechBot:
                         thumbnail_file = temp_thumb_path
                     elif await generate_random_thumbnail(temp_thumb_path):
                         thumbnail_file = temp_thumb_path
+
+                # Indicate finalizing before send
+                self.progress_state['stage'] = "Finalizing"
+                self.progress_state['percent'] = 100.0
+                display = progress_display(
+                    self.progress_state['stage'],
+                    self.progress_state['percent'],
+                    self.progress_state['done_size'],
+                    self.progress_state['total_size'],
+                    self.progress_state['speed'],
+                    self.progress_state['elapsed'],
+                    sender.first_name,
+                    sender.id,
+                    os.path.basename(filepath)
+                )
+                async with self.update_lock:
+                    status_msg = await send_message_with_flood_control(entity=event.chat_id, message=display, edit_message=status_msg)
 
                 # Send the file directly with thumbnail
                 if thumbnail_file and os.path.exists(thumbnail_file):
@@ -1688,30 +1762,35 @@ async def start_handler(event):
         return
 
     welcome_message = (
-        "🎬 **ZeroTrace Leech Bot** 🎬\n\n"
-        "Welcome! Here are the available commands:\n\n"
-        "📥 /leech - Download videos from MPD URLs\n"
-        "   Format: /leech\n"
-        "   `<mpd_url>|<key>|<name>` or `<direct_url>|<name>`\n\n"
-        "📥 /mplink - Quick leech for direct `.mp4` (or any direct file)\n"
-        "   Format: /mplink\n"
-        "   `<direct_url>|<name>`\n\n"
-        "📋 /loadjson - Load JSON data for batch processing\n"
-        "⚡ /processjson [range] - Process JSON data\n"
-        "   Examples: /processjson all, /processjson 1-50\n\n"
-        "📦 /bulk - Start bulk JSON processing mode\n"
-        "🚀 /processbulk - Process multiple JSONs sequentially\n"
-        "🧹 /clearbulk - Clear stored bulk JSON data\n\n"
-        "📊 /speed - Check download/upload speeds\n"
-        "📊 /status - Live status of your current task\n"
-        "🧹 /clearall - Clear all tasks from your queue\n"
-        "🗑️ /clear - Complete cleanup (queue + files + data)\n\n"
-        "🖼️ /addthumbnail - Add custom thumbnail (send photo)\n"
-        "❌ /removethumbnail - Remove custom thumbnail\n\n"
-        "**Admin Commands:**\n"
-        "🔑 /addadmin - Add admin user with full access\n"
-        "🗑️ /removeadmin - Remove admin user access\n\n"
-        "Ready to download! 🚀"
+        "✨ ————  𝚉𝚎𝚛𝚘𝚃𝚛𝚊𝚌𝚎 𝙻𝚎𝚎𝚌𝚑 𝙱𝚘𝚝  ———— ✨\n\n"
+        "Hello! I'm your ultra-fast Telegram leech bot. Here's what I can do for you:\n\n"
+        "📥  𝗟𝗲𝗲𝗰𝗵 (DRM/Direct)\n"
+        "   • /leech\n"
+        "   • `<mpd_url>|<key>|<name>`\n"
+        "   • `<direct_url>|<name>` or `/leech <direct_url>`\n\n"
+        "⚡  𝗤𝘂𝗶𝗰𝗸 𝗠𝗣𝟰 𝗟𝗲𝗲𝗰𝗵\n"
+        "   • /mplink `<direct_url>|<name>`\n\n"
+        "📋  𝗝𝗦𝗢𝗡 𝗪𝗼𝗿𝗸𝗳𝗹𝗼𝘄\n"
+        "   • /loadjson — send JSON file or text\n"
+        "   • /processjson [range] — e.g. `all`, `1-50`, `5`\n\n"
+        "📦  𝗕𝘂𝗹𝗸 𝗣𝗿𝗼𝗰𝗲𝘀𝘀𝗶𝗻𝗴\n"
+        "   • /bulk — start bulk mode\n"
+        "   • /processbulk — process each JSON sequentially\n"
+        "   • /clearbulk — clear stored JSONs\n\n"
+        "🎛️  𝗛𝗲𝗹𝗽𝗳𝘂𝗹 𝗖𝗼𝗻𝘁𝗿𝗼𝗹𝘀\n"
+        "   • /speed — live VPS speed test\n"
+        "   • /status — current task status\n"
+        "   • /skip — skip current task\n"
+        "   • /skip 3-5 — skip queued tasks 3 to 5\n"
+        "   • /clearall — stop and clear queue\n"
+        "   • /clear — full cleanup\n\n"
+        "🖼️  𝗧𝗵𝘂𝗺𝗯𝗻𝗮𝗶𝗹𝘀\n"
+        "   • /addthumbnail — send a photo\n"
+        "   • /removethumbnail — remove custom thumbnail\n\n"
+        "🛡️  𝗔𝗱𝗺𝗶𝗻\n"
+        "   • /addadmin <id>\n"
+        "   • /removeadmin <id>\n\n"
+        "Ready to go. Drop links and I'll fly! 🚀"
     )
 
     await send_message_with_flood_control(
@@ -1896,10 +1975,10 @@ async def leech_handler(event):
             event=event
         )
 
-@client.on(events.NewMessage(pattern=r'^/clearall'))
+@client.on(events.NewMessage(pattern=r'^/(clearall|stop)$'))
 async def clearall_handler(event):
     sender = await event.get_sender()
-    logging.info(f"Received /clearall command from user {sender.id}")
+    logging.info(f"Received /clearall or /stop command from user {sender.id}")
 
     if sender.id not in authorized_users:
         await send_message_with_flood_control(
@@ -1936,11 +2015,7 @@ async def clearall_handler(event):
         user_bot_instances[sender.id] = None
         logging.info(f"Cleared {cleared_count} tasks from queue for user {sender.id}")
 
-    await send_message_with_flood_control(
-        entity=event.chat_id,
-        message=f"🧹 Stopped active downloads and cleared {cleared_count} task(s) from your queue.",
-        event=event
-    )
+    await send_message_with_flood_control(entity=event.chat_id, message=f"🛑 Stopped and cleared {cleared_count} queued task(s).", event=event)
 
 @client.on(events.NewMessage(pattern=r'^/clear'))
 async def clear_handler(event):
