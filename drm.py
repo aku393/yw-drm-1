@@ -2,6 +2,7 @@
 import os
 import xml.etree.ElementTree as ET
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeVideo, InputFileBig
 from telethon.tl.functions.upload import SaveBigFilePartRequest
 from telethon.tl.functions.messages import UploadMediaRequest
@@ -24,6 +25,7 @@ import mmap  # For zero-copy file part reads to speed up uploads
 import re
 import sys
 from urllib.parse import urlparse, unquote
+import psutil
 from telethon.errors.rpcerrorlist import FloodWaitError  # Import FloodWaitError
 from collections import deque  # For task queue
 import json
@@ -44,6 +46,7 @@ load_dotenv()
 API_ID = os.getenv('API_ID')
 API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
+SESSION_STRING = os.getenv('SESSION_STRING')
 ALLOWED_USERS = os.getenv('ALLOWED_USERS', '')
 
 if not all([API_ID, API_HASH, BOT_TOKEN, ALLOWED_USERS]):
@@ -211,7 +214,11 @@ except Exception as e:
     raise
 
 # Initialize Telegram client with optimized settings
-client = TelegramClient('bot', API_ID, API_HASH, connection_retries=5, auto_reconnect=True)
+if SESSION_STRING:
+    logging.info("Using StringSession from environment")
+    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH, connection_retries=5, auto_reconnect=True)
+else:
+    client = TelegramClient('bot', API_ID, API_HASH, connection_retries=5, auto_reconnect=True)
 
 # Helper function to get user-specific locks and queues
 def get_user_resources(user_id):
@@ -228,8 +235,8 @@ def get_user_resources(user_id):
 # Helper function to handle flood wait errors and throttle message sends
 async def send_message_with_flood_control(entity, message, event=None, edit_message=None):
     async with message_rate_limit_lock:
-        # Throttle message sends to 1 per 2 seconds to avoid hitting rate limits
-        await asyncio.sleep(2)  # Increased from 1 to 2 seconds
+        # Throttle message sends to 1 per 1.2 seconds to avoid hitting rate limits but keep UI snappy
+        await asyncio.sleep(1.2)
         while True:
             try:
                 if edit_message:
@@ -780,34 +787,42 @@ class MPDLeechBot:
             )
 
             # Read stderr progressively to compute in-part progress percent
+            buffer = b""
             while True:
                 if cancel_event and cancel_event.is_set():
                     process.kill()
                     raise asyncio.CancelledError()
-                line = await process.stderr.readline()
-                if not line:
+                chunk = await process.stderr.read(1024)
+                if not chunk:
                     break
-                text = line.decode(errors='ignore').strip()
-                # Example stats lines include: time=00:00:12.34
-                if 'time=' in text and progress_cb:
+                buffer += chunk
+                # ffmpeg -stats often uses carriage returns without newlines
+                texts = re.split(rb"\r|\n", buffer)
+                buffer = texts[-1] if texts else b""
+                for raw in texts[:-1]:
                     try:
-                        t_str = text.split('time=')[-1].split(' ')[0]
-                        h, m, s = 0, 0, 0.0
-                        parts = t_str.split(':')
-                        if len(parts) == 3:
-                            h = int(parts[0])
-                            m = int(parts[1])
-                            s = float(parts[2])
-                        elif len(parts) == 2:
-                            m = int(parts[0])
-                            s = float(parts[1])
-                        else:
-                            s = float(parts[0])
-                        elapsed = h * 3600 + m * 60 + s
-                        part_percent = min(100.0, max(0.0, (elapsed / chunk_duration) * 100 if chunk_duration > 0 else 0))
-                        await progress_cb(i, num_chunks, part_percent)
+                        text = raw.decode(errors='ignore')
                     except Exception:
-                        pass
+                        continue
+                    if 'time=' in text and progress_cb:
+                        try:
+                            t_str = text.split('time=')[-1].split()[0]
+                            h, m, s = 0, 0, 0.0
+                            parts = t_str.split(':')
+                            if len(parts) == 3:
+                                h = int(parts[0])
+                                m = int(parts[1])
+                                s = float(parts[2])
+                            elif len(parts) == 2:
+                                m = int(parts[0])
+                                s = float(parts[1])
+                            else:
+                                s = float(parts[0])
+                            elapsed = h * 3600 + m * 60 + s
+                            part_percent = min(100.0, max(0.0, (elapsed / chunk_duration) * 100 if chunk_duration > 0 else 0))
+                            await progress_cb(i, num_chunks, part_percent)
+                        except Exception:
+                            pass
 
             stdout, stderr = await process.communicate()
             if process.returncode == 0:
@@ -1256,35 +1271,38 @@ class MPDLeechBot:
                     )
                     self.has_notified_split = True
                     logging.info(f"Notified user about splitting file: {filepath}")
+                splitting_start = time.time()
                 # Splitting progress callback
                 async def splitting_progress(current_index, total_parts, part_percent):
-                    # current_index is 0..total_parts during progress lines, total at completion
+                    # Estimate processed bytes and ETA
+                    processed_ratio = ((current_index + (part_percent / 100.0)) / total_parts) if total_parts else 0.0
+                    processed_bytes = int(file_size * processed_ratio)
+                    elapsed = time.time() - splitting_start
+                    speed = (processed_bytes / elapsed) if elapsed > 0 else 0
+                    remaining = max(0, file_size - processed_bytes)
+                    # Update progress_state in bytes
                     self.progress_state['stage'] = "Splitting"
-                    self.progress_state['total_size'] = total_parts
-                    # Map done_size to bytes-like semantics to reuse bar: done parts out of total
-                    self.progress_state['done_size'] = current_index
-                    overall_percent = 0.0
-                    if total_parts > 0:
-                        overall_percent = ((current_index + (part_percent / 100.0)) / total_parts) * 100.0
-                    self.progress_state['percent'] = min(100.0, max(0.0, overall_percent))
+                    self.progress_state['total_size'] = file_size
+                    self.progress_state['done_size'] = processed_bytes
+                    self.progress_state['percent'] = min(100.0, max(0.0, processed_ratio * 100.0))
+                    self.progress_state['elapsed'] = elapsed
+                    self.progress_state['speed'] = speed
+                    # Render display
                     display = progress_display(
                         self.progress_state['stage'],
                         self.progress_state['percent'],
                         self.progress_state['done_size'],
                         self.progress_state['total_size'],
-                        0,
-                        time.time() - self.progress_state['start_time'],
+                        self.progress_state['speed'],
+                        self.progress_state['elapsed'],
                         sender.first_name,
                         sender.id,
                         f"{os.path.basename(filepath)} (Part {min(current_index+1, total_parts)}/{total_parts})"
                     )
                     nonlocal status_msg
                     async with self.update_lock:
-                        status_msg = await send_message_with_flood_control(
-                            entity=event.chat_id,
-                            message=display,
-                            edit_message=status_msg
-                        )
+                        status_msg = await send_message_with_flood_control(entity=event.chat_id, message=display, edit_message=status_msg)
+
                 chunks = await self.split_file(filepath, max_size_mb=max_size_mb, progress_cb=splitting_progress, cancel_event=self.abort_event)
                 for i, chunk in enumerate(chunks):
                     chunk_size = os.path.getsize(chunk)
@@ -3238,7 +3256,10 @@ async def skip_handler(event):
 async def main():
     while True:
         try:
-            await client.start(bot_token=BOT_TOKEN)
+            if SESSION_STRING:
+                await client.start()
+            else:
+                await client.start(bot_token=BOT_TOKEN)
             logging.info("Bot started successfully!")
 
             me = await client.get_me()
