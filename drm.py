@@ -741,9 +741,9 @@ class MPDLeechBot:
             logging.error(f"mp4decrypt error: {str(e)}")
             raise
 
-    async def split_file(self, input_file, max_size_mb=1900, progress_cb=None, cancel_event=None):
-        """Split large files based on size with progress tracking and proper cleanup"""
-        max_size = max_size_mb * 1024 * 1024  # 1.9GB = 1900MB
+    async def split_file(self, input_file, max_size_mb=4000, progress_cb=None, cancel_event=None):
+        """Split large files with progress tracking and proper cleanup"""
+        max_size = max_size_mb * 1024 * 1024
         file_size = os.path.getsize(input_file)
 
         # If file is within size limit, return as-is
@@ -757,11 +757,12 @@ class MPDLeechBot:
         ext = os.path.splitext(input_file)[1]
         chunks = []
 
-        # Get video duration for calculating target duration per chunk
+        # Get video duration more reliably with better error handling
         duration = 0
         duration_methods = [
             ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', input_file],
             ['ffprobe', '-v', 'quiet', '-show_entries', 'stream=duration', '-of', 'csv=p=0', input_file],
+            ['mediainfo', '--Inform=General;%Duration%', input_file]
         ]
 
         for cmd in duration_methods:
@@ -769,13 +770,17 @@ class MPDLeechBot:
                 process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                 stdout, stderr = await process.communicate()
                 if process.returncode == 0 and stdout.decode().strip():
-                    duration = float(stdout.decode().strip())
+                    duration_str = stdout.decode().strip()
+                    if cmd[0] == 'mediainfo':
+                        duration = float(duration_str) / 1000.0  # mediainfo returns milliseconds
+                    else:
+                        duration = float(duration_str)
                     if duration > 0:
                         break
             except:
                 continue
 
-        # Fallback duration detection
+        # Fallback method if duration detection fails
         if duration <= 0:
             try:
                 cmd = ['ffmpeg', '-i', input_file, '-f', 'null', '-', '-y']
@@ -793,24 +798,26 @@ class MPDLeechBot:
             except:
                 pass
 
-        # Calculate number of chunks based on file size
+        # For very large files, estimate duration based on typical bitrates
+        if duration <= 0:
+            # Estimate based on typical video bitrates (1-10 Mbps)
+            estimated_bitrate = 5 * 1024 * 1024  # 5 Mbps default
+            duration = (file_size * 8) / estimated_bitrate  # Convert to seconds
+            logging.warning(f"Could not determine duration for {input_file}, estimated {duration:.1f}s based on file size")
+
+        # Calculate number of chunks needed
         num_chunks = max(1, int((file_size + max_size - 1) / max_size))  # Ceiling division
-        target_size_per_chunk = file_size / num_chunks
-        
-        # Calculate approximate duration per chunk if we have total duration
-        if duration > 0:
-            chunk_duration = duration / num_chunks
-            # Ensure minimum chunk duration of 30 seconds
-            chunk_duration = max(30, chunk_duration)
-        else:
-            # Fallback: estimate based on typical bitrates
-            estimated_bitrate = file_size * 8 / max(duration, 1) if duration > 0 else 5 * 1024 * 1024  # 5 Mbps default
-            chunk_duration = (target_size_per_chunk * 8) / estimated_bitrate
-            chunk_duration = max(30, min(chunk_duration, 3600))  # Between 30s and 1 hour
+        chunk_duration = duration / num_chunks
 
-        logging.info(f"Splitting {format_size(file_size)} file into {num_chunks} parts, target size: {format_size(target_size_per_chunk)} each, ~{chunk_duration:.1f}s per part")
+        # Ensure reasonable chunk duration (minimum 30 seconds, maximum 1 hour for very large files)
+        chunk_duration = max(30, min(chunk_duration, 3600))
 
-        current_time = 0
+        # Recalculate number of chunks based on duration constraints
+        if chunk_duration < duration / num_chunks:
+            num_chunks = max(1, int(duration / chunk_duration))
+
+        logging.info(f"Splitting {format_size(file_size)} file into {num_chunks} parts, each ~{chunk_duration:.1f}s ({format_size(file_size/num_chunks)} avg)")
+
         for i in range(num_chunks):
             # Check for cancellation
             if cancel_event and cancel_event.is_set():
@@ -818,6 +825,7 @@ class MPDLeechBot:
                 break
 
             output_file = f"{base_name}_part{str(i+1).zfill(3)}{ext}"  # Zero-padded for better sorting
+            start_time = i * chunk_duration
 
             # Update progress callback if provided
             if progress_cb:
@@ -826,26 +834,24 @@ class MPDLeechBot:
                 except Exception as e:
                     logging.warning(f"Progress callback error: {e}")
 
-            # Use size-based splitting with FFmpeg segment feature for better accuracy
+            # Enhanced FFmpeg command with better error handling for large files
             if i == num_chunks - 1:
                 # Last chunk - get everything remaining
                 cmd = [
-                    'ffmpeg', '-i', input_file,
-                    '-ss', str(current_time),
-                    '-c', 'copy',
+                    'ffmpeg', '-i', input_file, 
+                    '-ss', str(start_time), 
+                    '-c', 'copy', 
                     '-avoid_negative_ts', 'make_zero',
                     '-map_metadata', '0',
                     '-movflags', '+faststart',
                     output_file, '-y'
                 ]
             else:
-                # Calculate duration to get approximately the target size
-                # We'll use the calculated chunk_duration but may need to adjust
                 cmd = [
-                    'ffmpeg', '-i', input_file,
-                    '-ss', str(current_time),
-                    '-t', str(chunk_duration),
-                    '-c', 'copy',
+                    'ffmpeg', '-i', input_file, 
+                    '-ss', str(start_time), 
+                    '-t', str(chunk_duration), 
+                    '-c', 'copy', 
                     '-avoid_negative_ts', 'make_zero',
                     '-map_metadata', '0',
                     '-movflags', '+faststart',
@@ -874,17 +880,6 @@ class MPDLeechBot:
                     if part_size > 0:
                         chunks.append(output_file)
                         logging.info(f"✅ Part {i+1}/{num_chunks}: {os.path.basename(output_file)} ({format_size(part_size)})")
-                        
-                        # If this part is larger than max_size, we need to adjust
-                        if part_size > max_size and i < num_chunks - 1:
-                            logging.warning(f"Part {i+1} size ({format_size(part_size)}) exceeds limit, adjusting duration for next parts")
-                            # Reduce chunk duration for remaining parts
-                            remaining_duration = duration - current_time - chunk_duration if duration > 0 else chunk_duration * (num_chunks - i - 1)
-                            remaining_parts = num_chunks - i - 1
-                            if remaining_parts > 0:
-                                chunk_duration = min(chunk_duration * 0.8, remaining_duration / remaining_parts)  # Reduce by 20%
-                        
-                        current_time += chunk_duration
                     else:
                         logging.error(f"❌ Part {i+1}/{num_chunks}: Empty file created")
                         if os.path.exists(output_file):
@@ -901,11 +896,6 @@ class MPDLeechBot:
 
         if len(chunks) < num_chunks:
             logging.warning(f"Created {len(chunks)} chunks out of expected {num_chunks}")
-
-        # Verify all chunks are within size limit
-        oversized_chunks = [(i, chunk) for i, chunk in enumerate(chunks) if os.path.getsize(chunk) > max_size]
-        if oversized_chunks:
-            logging.warning(f"Found {len(oversized_chunks)} oversized chunks, may need further splitting")
 
         total_chunks_size = sum(os.path.getsize(chunk) for chunk in chunks)
         logging.info(f"Splitting complete: {len(chunks)} parts, total size: {format_size(total_chunks_size)}")
@@ -1316,9 +1306,13 @@ class MPDLeechBot:
             self.progress_state['speed'] = 0
             self.progress_state['elapsed'] = 0
 
-            # Set size limits to 1.9GB cap for all users
-            max_size_mb = 1900  # 1.9GB cap for all users
-            max_size_bytes = 1900 * 1024 * 1024  # 1.9GB limit
+            # Set size limits optimized for large files
+            if is_premium:
+                max_size_mb = 3900  # 3.9GB for premium (safer than 4GB)
+                max_size_bytes = 4 * 1024 * 1024 * 1024  # 4GB limit
+            else:
+                max_size_mb = 1900  # 1.9GB for free (safer than 2GB)
+                max_size_bytes = 2 * 1024 * 1024 * 1024  # 2GB limit
 
             user_type = "PREMIUM" if is_premium else "FREE"
             logging.info(f"User {sender.id} is {user_type}, max file size: {format_size(max_size_bytes)}")
@@ -1416,7 +1410,7 @@ class MPDLeechBot:
                     chunk_info = f"Part {i+1}/{total_chunks} ({format_size(chunk_size)})"
                     logging.info(f"Starting upload of {chunk_info} for user {sender.id}")
 
-                    # Custom parallel upload for each chunk with high-speed optimization
+                    # Custom parallel upload for each chunk with optimized settings
                     file_id = random.getrandbits(63)  # Generate a 63-bit file ID (0 to 2^63 - 1)
                     part_size = 524288  # Exactly 512 KB (524288 bytes) - Telegram requirement
                     total_parts = (chunk_size + part_size - 1) // part_size
@@ -1430,54 +1424,48 @@ class MPDLeechBot:
                     if last_part_size <= 0 or last_part_size > part_size:
                         logging.warning(f"Chunk {i+1}: Last part size validation - {last_part_size} bytes")
 
-                    # Maximum concurrency for ultra-fast uploads (same as download)
-                    max_concurrent = 15  # High concurrency for maximum speed
+                    # Optimize concurrency based on file size and network conditions
+                    if chunk_size > 1024 * 1024 * 1024:  # > 1GB chunks
+                        max_concurrent = 3  # Lower concurrency for very large chunks
+                    elif chunk_size > 500 * 1024 * 1024:  # > 500MB chunks
+                        max_concurrent = 4
+                    else:
+                        max_concurrent = 6  # Higher for smaller chunks
+
                     semaphore = asyncio.Semaphore(max_concurrent)
                     logging.info(f"Chunk {i+1}/{len(chunks)}: {format_size(chunk_size)}, {total_parts} parts, {max_concurrent} concurrent, file_id: {file_id}")
 
-                    async def upload_part_fast(file_id, part_num, part_size, total_parts, chunk_path, progress, semaphore):
-                        """Ultra-fast upload using memory-mapped files and retry logic"""
+                    async def upload_part(file_id, part_num, part_size, total_parts, file_handle, progress, semaphore):
+                        """Upload a single part of a large file"""
                         async with semaphore:
-                            retries = 3
-                            for attempt in range(retries):
-                                try:
-                                    # Use memory-mapped file for zero-copy reads
-                                    with open(chunk_path, 'rb') as f:
-                                        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                                            start_pos = part_num * part_size
-                                            end_pos = min(start_pos + part_size, len(mm))
-                                            data = mm[start_pos:end_pos]
-                                    
-                                    if not data:
-                                        logging.warning(f"No data read for part {part_num}")
-                                        return (part_num, False, "No data")
+                            try:
+                                # Read part data
+                                file_handle.seek(part_num * part_size)
+                                data = file_handle.read(part_size)
+                                
+                                if not data:
+                                    logging.warning(f"No data read for part {part_num}")
+                                    return (part_num, False, "No data")
 
-                                    # Use SaveBigFilePartRequest for large files with retries
-                                    result = await client(SaveBigFilePartRequest(
-                                        file_id=file_id,
-                                        file_part=part_num,
-                                        file_total_parts=total_parts,
-                                        bytes=data
-                                    ))
+                                # Use SaveBigFilePartRequest for large files
+                                result = await client(SaveBigFilePartRequest(
+                                    file_id=file_id,
+                                    file_part=part_num,
+                                    file_total_parts=total_parts,
+                                    bytes=data
+                                ))
 
-                                    if result:
-                                        progress['uploaded'] += len(data)
-                                        return (part_num, True, None)
-                                    else:
-                                        if attempt < retries - 1:
-                                            await asyncio.sleep(0.5 * (attempt + 1))  # Exponential backoff
-                                            continue
-                                        return (part_num, False, "Upload returned False")
+                                if result:
+                                    progress['uploaded'] += len(data)
+                                    logging.info(f"Part {part_num}/{total_parts-1} uploaded successfully ({len(data)} bytes)")
+                                    return (part_num, True, None)
+                                else:
+                                    logging.error(f"Part {part_num} upload failed - no result")
+                                    return (part_num, False, "Upload returned False")
 
-                                except Exception as e:
-                                    if attempt < retries - 1:
-                                        logging.warning(f"Part {part_num} upload attempt {attempt + 1} failed: {e}, retrying...")
-                                        await asyncio.sleep(0.5 * (attempt + 1))
-                                        continue
-                                    logging.error(f"Part {part_num} upload failed after {retries} attempts: {e}")
-                                    return (part_num, False, str(e))
-                            
-                            return (part_num, False, "Max retries exceeded")
+                            except Exception as e:
+                                logging.error(f"Part {part_num} upload error: {e}")
+                                return (part_num, False, str(e))
 
                     async def update_progress():
                         nonlocal last_update_time, status_msg
@@ -1486,17 +1474,25 @@ class MPDLeechBot:
                         while progress['uploaded'] < chunk_size and not asyncio.current_task().cancelled():
                             current_time = time.time()
 
-                            # Fast UI updates for better user experience (same as download)
-                            update_interval = 3  # Quick updates like download progress
+                            # Adaptive update frequency based on file size
+                            if chunk_size > 1024 * 1024 * 1024:  # > 1GB
+                                update_interval = 10  # Less frequent for very large files
+                            else:
+                                update_interval = 5   # More frequent for smaller files
 
                             if current_time - last_update_time < update_interval:
-                                await asyncio.sleep(0.2)
+                                await asyncio.sleep(1)
                                 continue
 
                             # Calculate current progress
                             self.progress_state['elapsed'] = current_time - self.progress_state['start_time']
                             current_speed = progress['uploaded'] / self.progress_state['elapsed'] if self.progress_state['elapsed'] > 0 else 0
                             current_percent = (progress['uploaded'] / chunk_size * 100) if chunk_size > 0 else 0
+
+                            # Only update if significant progress change (5% or more)
+                            if abs(current_percent - last_percent) < 5.0 and current_percent < 95:
+                                await asyncio.sleep(2)
+                                continue
 
                             # Update progress state
                             self.progress_state['speed'] = current_speed
@@ -1528,26 +1524,23 @@ class MPDLeechBot:
                                 except Exception as e:
                                     logging.warning(f"Progress update failed: {e}")
 
-                            await asyncio.sleep(3)  # Update every 3 seconds like download
+                            await asyncio.sleep(2)
 
                     upload_start = time.time()
-                    # Create all upload tasks for maximum parallel execution
-                    tasks = []
-                    for part_num in range(total_parts):
-                        tasks.append(upload_part_fast(file_id, part_num, part_size, total_parts, chunk, progress, semaphore))
-                    
-                    # Start progress update task
-                    progress_task = asyncio.create_task(update_progress())
-                    
-                    # Upload all parts in parallel with maximum concurrency
-                    results = await asyncio.gather(*tasks, return_exceptions=False)
-                    
-                    # Cancel progress task
-                    progress_task.cancel()
-                    try:
-                        await progress_task
-                    except asyncio.CancelledError:
-                        logging.info(f"Progress task for chunk {i+1} cancelled")
+                    with open(chunk, 'rb', buffering=0) as f:
+                        tasks = []
+                        for part_num in range(total_parts):
+                            tasks.append(upload_part(file_id, part_num, part_size, total_parts, f, progress, semaphore))
+                        # Start progress update task
+                        progress_task = asyncio.create_task(update_progress())
+                        # Upload all parts in parallel
+                        results = await asyncio.gather(*tasks, return_exceptions=False)
+                        # Cancel progress task
+                        progress_task.cancel()
+                        try:
+                            await progress_task
+                        except asyncio.CancelledError:
+                            logging.info(f"Progress task for chunk {i+1} cancelled")
 
                     # Check for failed parts
                     failed_parts = [(part_num, error) for part_num, success, error in results if not success]
