@@ -894,10 +894,10 @@ class MPDLeechBot:
             total_duration = 0
 
         if total_duration == 0:
-            logging.warning("Could not determine video duration, falling back to simple file splitting")
+            logging.warning("Could not determine video duration, falling back to simple file splitting using FFmpeg segment")
             # Fallback to simple file size splitting using FFmpeg segment
             segment_size = max_size_mb * 1024 * 1024  # Size in bytes
-            
+
             ffmpeg_cmd = [
                 'ffmpeg', '-i', input_file,
                 '-c', 'copy',  # Stream copy to maintain quality
@@ -912,12 +912,12 @@ class MPDLeechBot:
             # Calculate segment duration based on target file size
             avg_bitrate = (file_size * 8) / total_duration  # bits per second
             target_duration = (max_size * 8) / avg_bitrate  # seconds per segment
-            
+
             # Ensure minimum duration of 10 seconds to avoid too many small segments
             segment_duration = max(target_duration, 10.0)
-            
+
             logging.info(f"Splitting {format_time(total_duration)} video into segments of ~{format_time(segment_duration)} each")
-            
+
             ffmpeg_cmd = [
                 'ffmpeg', '-i', input_file,
                 '-c', 'copy',  # Stream copy to maintain quality
@@ -925,7 +925,6 @@ class MPDLeechBot:
                 '-segment_time', str(segment_duration),
                 '-segment_format', 'mp4',
                 '-reset_timestamps', '1',
-                '-avoid_negative_ts', 'make_zero',
                 f"{base_name}_part%03d{ext}",
                 '-y'
             ]
@@ -953,29 +952,67 @@ class MPDLeechBot:
                 import glob
                 segment_pattern = f"{base_name}_part*{ext}"
                 generated_files = sorted(glob.glob(segment_pattern))
-                
+
+                # Clean up any temporary .raw files that might have been created
+                raw_pattern = f"{base_name}_temp_part*.raw"
+                raw_files = glob.glob(raw_pattern)
+                for raw_file in raw_files:
+                    try:
+                        os.remove(raw_file)
+                        logging.info(f"Cleaned up temporary file: {raw_file}")
+                    except:
+                        pass
+
                 if generated_files:
-                    chunks = generated_files
-                    logging.info(f"✅ FFmpeg segmentation successful: {len(chunks)} parts created")
-                    
-                    # Log details of each chunk
-                    total_chunks_size = 0
-                    oversized_chunks = []
-                    for i, chunk in enumerate(chunks, 1):
-                        chunk_size = os.path.getsize(chunk)
-                        total_chunks_size += chunk_size
-                        size_check = "✅" if chunk_size <= max_size * 1.05 else "⚠️"  # 5% tolerance
-                        logging.info(f"{size_check} Part {i}/{len(chunks)}: {format_size(chunk_size)} ({os.path.basename(chunk)})")
-                        
-                        if chunk_size > max_size * 1.05:
-                            oversized_chunks.append((i, chunk, chunk_size))
-                    
-                    if oversized_chunks:
-                        logging.warning(f"Found {len(oversized_chunks)} oversized chunks:")
-                        for part_num, chunk_path, chunk_size in oversized_chunks:
-                            logging.warning(f"  Part {part_num}: {format_size(chunk_size)} > {format_size(max_size)}")
-                    
-                    logging.info(f"✅ Total segments size: {format_size(total_chunks_size)}")
+                    # Validate that all generated files are proper video files
+                    valid_chunks = []
+                    for chunk in generated_files:
+                        try:
+                            # Quick validation using ffprobe
+                            validate_cmd = ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', chunk]
+                            validate_process = await asyncio.create_subprocess_exec(*validate_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                            validate_stdout, validate_stderr = await validate_process.communicate()
+
+                            if validate_process.returncode == 0 and os.path.getsize(chunk) > 1024:  # At least 1KB
+                                valid_chunks.append(chunk)
+                                logging.info(f"✅ Valid chunk: {os.path.basename(chunk)} ({format_size(os.path.getsize(chunk))})")
+                            else:
+                                logging.warning(f"⚠️ Invalid chunk detected, removing: {chunk}")
+                                try:
+                                    os.remove(chunk)
+                                except:
+                                    pass
+                        except Exception as e:
+                            logging.warning(f"⚠️ Could not validate chunk {chunk}: {e}")
+                            # Keep it anyway, might still be valid
+                            valid_chunks.append(chunk)
+
+                    chunks = valid_chunks
+                    if chunks:
+                        logging.info(f"✅ FFmpeg segmentation successful: {len(chunks)} valid parts created")
+
+                        # Log details of each chunk
+                        total_chunks_size = 0
+                        oversized_chunks = []
+                        for i, chunk in enumerate(chunks, 1):
+                            chunk_size = os.path.getsize(chunk)
+                            total_chunks_size += chunk_size
+                            size_check = "✅" if chunk_size <= max_size * 1.05 else "⚠️"  # 5% tolerance
+                            logging.info(f"{size_check} Part {i}/{len(chunks)}: {format_size(chunk_size)} ({os.path.basename(chunk)})")
+
+                            if chunk_size > max_size * 1.05:
+                                oversized_chunks.append((i, chunk, chunk_size))
+
+                        if oversized_chunks:
+                            logging.warning(f"Found {len(oversized_chunks)} oversized chunks:")
+                            for part_num, chunk_path, chunk_size in oversized_chunks:
+                                logging.warning(f"Part {part_num}: {format_size(chunk_size)} > {format_size(max_size)}")
+
+                        logging.info(f"✅ Total segments size: {format_size(total_chunks_size)}")
+                    else:
+                        error_msg = "All generated segments were invalid or corrupted"
+                        logging.error(f"❌ FFmpeg segmentation failed: {error_msg}")
+                        raise Exception(f"FFmpeg segmentation failed: {error_msg}")
                 else:
                     error_msg = stderr.decode() if stderr else "No output files generated"
                     logging.error(f"❌ FFmpeg segmentation failed: {error_msg}")
@@ -984,13 +1021,6 @@ class MPDLeechBot:
                 error_msg = stderr.decode() if stderr else "Unknown FFmpeg error"
                 logging.error(f"❌ FFmpeg segmentation failed: {error_msg}")
                 raise Exception(f"FFmpeg segmentation failed: {error_msg}")
-
-            # Update progress callback for completion
-            if progress_cb:
-                try:
-                    await progress_cb(1, 1, 100.0)
-                except Exception as e:
-                    logging.warning(f"Progress callback error: {e}")
 
         except Exception as e:
             logging.error(f"❌ Exception during file splitting: {str(e)}")
@@ -1901,24 +1931,24 @@ class MPDLeechBot:
                                         end_pos = min(start_pos + part_size, len(mm))
                                         data = mm[start_pos:end_pos]
 
-                                if not data:
-                                    return (part_num, False, "No data")
+                                    if not data:
+                                        return (part_num, False, "No data")
 
-                                result = await client(SaveBigFilePartRequest(
-                                    file_id=file_id,
-                                    file_part=part_num,
-                                    file_total_parts=total_parts,
-                                    bytes=data
-                                ))
+                                    result = await client(SaveBigFilePartRequest(
+                                        file_id=file_id,
+                                        file_part=part_num,
+                                        file_total_parts=total_parts,
+                                        bytes=data
+                                    ))
 
-                                if result:
-                                    progress['uploaded'] += len(data)
-                                    return (part_num, True, None)
-                                else:
-                                    if attempt < retries - 1:
-                                        await asyncio.sleep(0.5 * (attempt + 1))
-                                        continue
-                                    return (part_num, False, "Upload returned False")
+                                    if result:
+                                        progress['uploaded'] += len(data)
+                                        return (part_num, True, None)
+                                    else:
+                                        if attempt < retries - 1:
+                                            await asyncio.sleep(0.5 * (attempt + 1))
+                                            continue
+                                        return (part_num, False, "Upload returned False")
 
                             except Exception as e:
                                 if attempt < retries - 1:
@@ -2540,6 +2570,7 @@ async def leech_handler(event):
                 user_queue.append(task)
                 position = len(user_queue)
                 logging.info(f"Task added to queue for user {sender.id}: {task['name']}.mp4, Position: {position}/{len(user_queue)}")
+
             # Reset abort flag if an instance exists
             if sender.id in user_bot_instances and user_bot_instances[sender.id]:
                 try:
@@ -2583,10 +2614,10 @@ async def leech_handler(event):
 
     except Exception as e:
         logging.error(f"Leech handler error: {str(e)}\n{traceback.format_exc()}")
-        error_msg = f"Failed to add tasks: {str(e)}"
+        error_message = f"Failed to add tasks: {str(e)}"
         await send_message_with_flood_control(
             entity=event.chat_id,
-            message=error_msg,
+            message=error_message,
             event=event
         )
 
@@ -3622,6 +3653,7 @@ async def processbulk_handler(event):
                         mpd_url = item.get('mpd_url')
                         keys = item.get('keys', [])
                         key = keys[0] if isinstance(keys, list) else keys
+
                         task = {
                             'type': 'drm',
                             'mpd_url': mpd_url,
