@@ -1735,33 +1735,68 @@ class MPDLeechBot:
                     part_size = 524288  # 512KB chunks for Telegram
                     total_parts = (chunk_size + part_size - 1) // part_size
 
-                    if total_parts <= 0:
-                        logging.error(f"Invalid total_parts for chunk {i+1}: {total_parts}")
+                    # Calculate optimal part size for large files
+                    # For 3.8GB+ files, we need larger parts to stay under 4000 part limit
+                    min_part_size = 1024 * 1024  # 1MB minimum
+                    max_part_size = 512 * 1024 * 1024  # 512MB maximum (Telegram limit)
+                    
+                    # Calculate required part size to stay under 4000 parts
+                    required_part_size = (chunk_size + 3999) // 4000
+                    
+                    # Round up to nearest 1MB for efficiency
+                    optimal_part_size = ((required_part_size + 1024 * 1024 - 1) // (1024 * 1024)) * (1024 * 1024)
+                    
+                    # Ensure part size is within limits
+                    part_size = max(min_part_size, min(optimal_part_size, max_part_size))
+                    
+                    # Recalculate total parts with optimal size
+                    total_parts = (chunk_size + part_size - 1) // part_size
+                    
+                    # Final validation
+                    if total_parts > 4000:
+                        # If still too many parts, use maximum allowed part size
+                        part_size = max_part_size
+                        total_parts = (chunk_size + part_size - 1) // part_size
+                        
+                    if total_parts <= 0 or total_parts > 4000:
+                        logging.error(f"CRITICAL: Cannot upload chunk {i+1}: {total_parts} parts (chunk_size: {chunk_size}, part_size: {part_size})")
                         continue
 
-                    max_concurrent = 15
+                    # Use session string client for large file uploads if available
+                    upload_client = admin_client if admin_client else client
+                    
+                    max_concurrent = 6  # Reduced for large files to avoid rate limits
                     semaphore = asyncio.Semaphore(max_concurrent)
-                    logging.info(f"Uploading Part {i+1}/{total_chunks}: {format_size(chunk_size)}, {total_parts} parts, file_id: {file_id}")
+                    logging.info(f"Uploading Part {i+1}/{total_chunks}: {format_size(chunk_size)}, {total_parts} parts, file_id: {file_id}, part_size: {format_size(part_size)} via {type(upload_client).__name__}")
 
-                    async def upload_part_fast(file_id, part_num, part_size, total_parts, chunk_path, progress, semaphore):
+                    async def upload_part_fast(file_id, part_num, part_size, total_parts, chunk_path, progress, semaphore, upload_client):
                         async with semaphore:
-                            retries = 3
+                            retries = 5  # Increased retries for large files
                             for attempt in range(retries):
                                 try:
                                     with open(chunk_path, 'rb') as f:
-                                        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                                            start_pos = part_num * part_size
-                                            end_pos = min(start_pos + part_size, len(mm))
-                                            data = mm[start_pos:end_pos]
+                                        f.seek(part_num * part_size)
+                                        data = f.read(part_size)
 
                                     if not data:
                                         return (part_num, False, "No data")
 
-                                    # Add timeout for individual part uploads
-                                    upload_timeout = 60 if len(data) > 512 * 1024 else 30
+                                    # Strict validation for large files
+                                    if part_num >= total_parts:
+                                        return (part_num, False, f"Part number {part_num} exceeds total parts {total_parts}")
+                                    
+                                    if part_num < 0:
+                                        return (part_num, False, f"Invalid part number {part_num}")
+                                    
+                                    if len(data) > 512 * 1024 * 1024:  # 512MB max
+                                        return (part_num, False, f"Part size {len(data)} exceeds 512MB limit")
 
+                                    # Extended timeout for large parts
+                                    upload_timeout = 180 if len(data) > 100 * 1024 * 1024 else 120
+
+                                    # Use the appropriate client (session string preferred for large files)
                                     result = await asyncio.wait_for(
-                                        client(SaveBigFilePartRequest(
+                                        upload_client(SaveBigFilePartRequest(
                                             file_id=file_id,
                                             file_part=part_num,
                                             file_total_parts=total_parts,
@@ -1775,14 +1810,25 @@ class MPDLeechBot:
                                         return (part_num, True, None)
                                     else:
                                         if attempt < retries - 1:
-                                            await asyncio.sleep(1 * (attempt + 1))  # Longer backoff
+                                            await asyncio.sleep(3 * (attempt + 1))  # Longer backoff for large files
                                             continue
                                         return (part_num, False, "Upload returned False")
 
                                 except Exception as e:
+                                    error_msg = str(e)
+                                    if "invalid" in error_msg.lower() and "parts" in error_msg.lower():
+                                        logging.error(f"Parts validation error - file_id: {file_id}, part: {part_num}, total: {total_parts}, data_size: {len(data) if 'data' in locals() else 'unknown'}")
+                                        logging.error(f"Chunk path: {chunk_path}, chunk size: {os.path.getsize(chunk_path) if os.path.exists(chunk_path) else 'N/A'}")
+                                    
+                                    if "flood" in error_msg.lower() or "wait" in error_msg.lower():
+                                        # Handle flood wait with exponential backoff
+                                        wait_time = min(60, 5 * (2 ** attempt))
+                                        logging.warning(f"Flood wait detected, waiting {wait_time}s before retry")
+                                        await asyncio.sleep(wait_time)
+                                    
                                     if attempt < retries - 1:
                                         logging.warning(f"Part {part_num} upload attempt {attempt + 1} failed: {e}, retrying...")
-                                        await asyncio.sleep(1 * (attempt + 1)) # Longer backoff
+                                        await asyncio.sleep(3 * (attempt + 1))
                                         continue
                                     return (part_num, False, str(e))
 
@@ -1844,10 +1890,10 @@ class MPDLeechBot:
                             # Wait exactly 6 seconds before next update
                             await asyncio.sleep(UPDATE_INTERVAL)
 
-                    # Upload all parts in parallel
+                    # Upload all parts in parallel using appropriate client
                     tasks = []
                     for part_num in range(total_parts):
-                        tasks.append(upload_part_fast(file_id, part_num, part_size, total_parts, chunk, progress, semaphore))
+                        tasks.append(upload_part_fast(file_id, part_num, part_size, total_parts, chunk, progress, semaphore, upload_client))
 
                     progress_task = asyncio.create_task(update_progress())
 
@@ -1940,13 +1986,10 @@ class MPDLeechBot:
                         except Exception as e:
                             logging.warning(f"Failed to extract video metadata: {e}")
 
-                        # Upload to log channel using session string client (required for 4GB+ files)
+                        # Upload to log channel using session string client (preferred for 4GB+ files)
                         async def upload_to_log_channel():
-                            # Force use of session string client for log channel uploads
-                            if not admin_client:
-                                raise Exception("Session string client not available for large file upload")
-                            
-                            upload_client = admin_client
+                            # Use session string client if available, otherwise fall back to bot client
+                            upload_client = admin_client if admin_client else client
                             if thumbnail_file and os.path.exists(thumbnail_file):
                                 return await upload_client.send_file(
                                     LOG_CHANNEL_ID,
@@ -2080,54 +2123,99 @@ class MPDLeechBot:
                 part_size = 524288  # 512KB chunks
                 total_parts = (file_size + part_size - 1) // part_size
 
-                if total_parts <= 0:
-                    raise Exception("Invalid file size for upload")
+                # Calculate optimal part size for large single files
+                min_part_size = 1024 * 1024  # 1MB minimum
+                max_part_size = 512 * 1024 * 1024  # 512MB maximum
+                
+                # Calculate required part size to stay under 4000 parts
+                required_part_size = (file_size + 3999) // 4000
+                
+                # Round up to nearest 1MB for efficiency
+                optimal_part_size = ((required_part_size + 1024 * 1024 - 1) // (1024 * 1024)) * (1024 * 1024)
+                
+                # Ensure part size is within limits
+                part_size = max(min_part_size, min(optimal_part_size, max_part_size))
+                
+                # Recalculate total parts with optimal size
+                total_parts = (file_size + part_size - 1) // part_size
+                
+                # Final validation
+                if total_parts > 4000:
+                    part_size = max_part_size
+                    total_parts = (file_size + part_size - 1) // part_size
 
-                max_concurrent = 15
+                if total_parts <= 0 or total_parts > 4000:
+                    raise Exception(f"CRITICAL: Cannot upload file: {total_parts} parts (file_size: {file_size}, part_size: {part_size})")
+
+                # Use session string client for large file uploads if available
+                upload_client = admin_client if admin_client else client
+                
+                max_concurrent = 6  # Reduced for large files
                 semaphore = asyncio.Semaphore(max_concurrent)
                 progress = {'uploaded': 0}
                 last_update_time = 0
+                logging.info(f"Single file upload: {format_size(file_size)}, {total_parts} parts, part_size: {format_size(part_size)} via {type(upload_client).__name__}")
 
-                async def upload_part_single(file_id, part_num, part_size, total_parts, file_path, progress, semaphore):
+                async def upload_part_single(file_id, part_num, part_size, total_parts, file_path, progress, semaphore, upload_client):
                     async with semaphore:
-                        retries = 3
+                        retries = 5  # Increased retries for large files
                         for attempt in range(retries):
                             try:
                                 with open(file_path, 'rb') as f:
-                                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                                        start_pos = part_num * part_size
-                                        end_pos = min(start_pos + part_size, len(mm))
-                                        data = mm[start_pos:end_pos]
+                                    f.seek(part_num * part_size)
+                                    data = f.read(part_size)
 
-                                    if not data:
-                                        return (part_num, False, "No data")
+                                if not data:
+                                    return (part_num, False, "No data")
 
-                                    # Add timeout for individual part uploads
-                                    upload_timeout = 60 if len(data) > 512 * 1024 else 30
+                                # Strict validation for large files
+                                if part_num >= total_parts:
+                                    return (part_num, False, f"Part number {part_num} exceeds total parts {total_parts}")
+                                
+                                if part_num < 0:
+                                    return (part_num, False, f"Invalid part number {part_num}")
+                                
+                                if len(data) > 512 * 1024 * 1024:  # 512MB max
+                                    return (part_num, False, f"Part size {len(data)} exceeds 512MB limit")
 
-                                    result = await asyncio.wait_for(
-                                        client(SaveBigFilePartRequest(
-                                            file_id=file_id,
-                                            file_part=part_num,
-                                            file_total_parts=total_parts,
-                                            bytes=data
-                                        )),
-                                        timeout=upload_timeout
-                                    )
+                                # Extended timeout for large parts
+                                upload_timeout = 180 if len(data) > 100 * 1024 * 1024 else 120
 
-                                    if result:
-                                        progress['uploaded'] += len(data)
-                                        return (part_num, True, None)
-                                    else:
-                                        if attempt < retries - 1:
-                                            await asyncio.sleep(1 * (attempt + 1))  # Longer backoff
-                                            continue
-                                        return (part_num, False, "Upload returned False")
+                                # Use the appropriate client (session string preferred for large files)
+                                result = await asyncio.wait_for(
+                                    upload_client(SaveBigFilePartRequest(
+                                        file_id=file_id,
+                                        file_part=part_num,
+                                        file_total_parts=total_parts,
+                                        bytes=data
+                                    )),
+                                    timeout=upload_timeout
+                                )
+
+                                if result:
+                                    progress['uploaded'] += len(data)
+                                    return (part_num, True, None)
+                                else:
+                                    if attempt < retries - 1:
+                                        await asyncio.sleep(3 * (attempt + 1))  # Longer backoff for large files
+                                        continue
+                                    return (part_num, False, "Upload returned False")
 
                             except Exception as e:
+                                error_msg = str(e)
+                                if "invalid" in error_msg.lower() and "parts" in error_msg.lower():
+                                    logging.error(f"Parts validation error - file_id: {file_id}, part: {part_num}, total: {total_parts}, data_size: {len(data) if 'data' in locals() else 'unknown'}")
+                                    logging.error(f"File path: {file_path}, file size: {os.path.getsize(file_path) if os.path.exists(file_path) else 'N/A'}")
+                                
+                                if "flood" in error_msg.lower() or "wait" in error_msg.lower():
+                                    # Handle flood wait with exponential backoff
+                                    wait_time = min(60, 5 * (2 ** attempt))
+                                    logging.warning(f"Flood wait detected, waiting {wait_time}s before retry")
+                                    await asyncio.sleep(wait_time)
+                                
                                 if attempt < retries - 1:
                                     logging.warning(f"Part {part_num} upload attempt {attempt + 1} failed: {e}, retrying...")
-                                    await asyncio.sleep(1 * (attempt + 1)) # Longer backoff
+                                    await asyncio.sleep(3 * (attempt + 1))
                                     continue
                                 return (part_num, False, str(e))
 
@@ -2185,10 +2273,10 @@ class MPDLeechBot:
                         # Wait exactly 6 seconds before next update
                         await asyncio.sleep(UPDATE_INTERVAL)
 
-                # Upload all parts in parallel
+                # Upload all parts in parallel using appropriate client
                 tasks = []
                 for part_num in range(total_parts):
-                    tasks.append(upload_part_single(file_id, part_num, part_size, total_parts, filepath, progress, semaphore))
+                    tasks.append(upload_part_single(file_id, part_num, part_size, total_parts, filepath, progress, semaphore, upload_client))
 
                 progress_task = asyncio.create_task(update_single_progress())
 
@@ -2282,13 +2370,10 @@ class MPDLeechBot:
                     except Exception as e:
                         logging.warning(f"Failed to extract video metadata: {e}")
 
-                    # Upload to log channel using session string client (required for large files)
+                    # Upload to log channel using session string client (preferred for large files)
                     async def upload_single_to_log_channel():
-                        # Force use of session string client for log channel uploads
-                        if not admin_client:
-                            raise Exception("Session string client not available for large file upload")
-                            
-                        upload_client = admin_client
+                        # Use session string client if available, otherwise fall back to bot client
+                        upload_client = admin_client if admin_client else client
                         if thumbnail_file and os.path.exists(thumbnail_file):
                             return await upload_client.send_file(
                                 LOG_CHANNEL_ID,
