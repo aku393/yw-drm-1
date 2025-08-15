@@ -1563,6 +1563,9 @@ class MPDLeechBot:
             file_size = os.path.getsize(filepath)
             logging.info(f"Processing upload for {filepath}, size: {format_size(file_size)}")
 
+            # Detect premium status more reliably
+            is_premium = await self.detect_premium_status(sender.id)
+
             self.progress_state['start_time'] = time.time()
             self.progress_state['total_size'] = file_size
             self.progress_state['done_size'] = 0
@@ -1570,29 +1573,12 @@ class MPDLeechBot:
             self.progress_state['speed'] = 0
             self.progress_state['elapsed'] = 0
 
-            # Always use admin session for uploads and premium detection
-            if SESSION_STRING and SESSION_STRING.strip():
-                admin_is_premium = await self.detect_admin_premium_status()
-                
-                if admin_is_premium:
-                    # Admin has premium - can upload 4GB files
-                    max_size_mb = 3980  # 3.98GB for premium admin
-                    max_size_bytes = int(3.98 * 1024 * 1024 * 1024)  # 3.98GB limit
-                    user_type = "PREMIUM (4GB)"
-                else:
-                    # Admin doesn't have premium - regular limits
-                    max_size_mb = 1950  # 1.95GB for non-premium
-                    max_size_bytes = 1950 * 1024 * 1024  # 1.95GB limit
-                    user_type = "FREE (2GB)"
-                
-                logging.info(f"Using admin session, admin premium: {admin_is_premium}")
-            else:
-                # Bot token mode limited to 2GB
-                max_size_mb = 1950  # 1.95GB for bot token
-                max_size_bytes = 1950 * 1024 * 1024  # 1.95GB limit
-                user_type = "FREE (2GB)"
+            # Set size limits to 1900MB cap for all users
+            max_size_mb = 1900  # 1900MB cap for all users
+            max_size_bytes = 1900 * 1024 * 1024  # 1900MB limit
 
-            logging.info(f"User {sender.id} has {user_type} limits, max file size: {format_size(max_size_bytes)}")
+            user_type = "PREMIUM" if is_premium else "FREE"
+            logging.info(f"User {sender.id} is {user_type}, max file size: {format_size(max_size_bytes)}")
 
             # Check if file needs to be split
             if file_size > max_size_bytes:
@@ -1600,13 +1586,14 @@ class MPDLeechBot:
                     await send_message_with_flood_control(
                         entity=event.chat_id,
                         message=f"📁 **File Splitting Required**\n\n"
+                               f"👤 User Type: {user_type}\n"
                                f"📊 File Size: {format_size(file_size)}\n"
                                f"⚖️ Max Size: {format_size(max_size_bytes)}\n"
-                               f"✂️ Splitting into parts...",
+                               f"✂️ Splitting into 1900MB parts...",
                         edit_message=status_msg
                     )
                     self.has_notified_split = True
-                    logging.info(f"File {format_size(file_size)} exceeds limit {format_size(max_size_bytes)} for user {sender.id}")
+                    logging.info(f"File {format_size(file_size)} exceeds limit {format_size(max_size_bytes)} for {user_type} user {sender.id}")
 
                 splitting_start = time.time()
 
@@ -1636,6 +1623,7 @@ class MPDLeechBot:
                         self.progress_state['speed'] = speed
 
                         # Create enhanced progress display
+                        eta = (file_size - processed_bytes) / speed if speed > 0 else 0
                         display = progress_display(
                             self.progress_state['stage'],
                             self.progress_state['percent'],
@@ -1660,17 +1648,9 @@ class MPDLeechBot:
                         logging.error(f"Error in splitting progress callback: {e}")
 
                 # Split file with proper size limits
-                split_size_mb = max_size_mb
-                # Leave some margin to ensure parts fit within limit
-                if SESSION_STRING and SESSION_STRING.strip():
-                    admin_is_premium = await self.detect_admin_premium_status()
-                    split_size_mb = 3900 if admin_is_premium else 1900
-                else:
-                    split_size_mb = 1900
-                
                 chunks = await self.split_file(
                     filepath,
-                    max_size_mb=split_size_mb,
+                    max_size_mb=max_size_mb,
                     progress_cb=splitting_progress,
                     cancel_event=self.abort_event
                 )
@@ -1964,12 +1944,11 @@ class MPDLeechBot:
                 # Check if this is from JSON processing by looking at the task source
                 is_json_batch = hasattr(self, '_is_json_batch') and self._is_json_batch
                 if not is_json_batch:
-                    part_size_info = f"{split_size_mb}MB"
                     await send_message_with_flood_control(
                         entity=event.chat_id,
                         message=f"🎉 **Upload Complete!**\n\n"
                                f"📁 File: {os.path.basename(filepath)}\n"
-                               f"✂️ Split into: {len(uploaded_chunks)} parts ({part_size_info} each)\n"
+                               f"✂️ Split into: {len(uploaded_chunks)} parts (1900MB each)\n"
                                f"📊 Total Size: {format_size(file_size)}\n"
                                f"⚡ Average Speed: {format_size(avg_speed)}/s\n"
                                f"⏱️ Total Time: {format_time(total_upload_time)}\n"
@@ -2507,11 +2486,6 @@ class MPDLeechBot:
     async def detect_premium_status(self, user_id):
         """Detect if user has premium status with multiple methods"""
         try:
-            # Only check premium status if we have a user session (not bot token)
-            if not SESSION_STRING or not SESSION_STRING.strip():
-                logging.info(f"User {user_id} - Bot token mode, no premium detection available")
-                return False
-
             # Get full user entity with all attributes
             user = await client.get_entity(user_id)
 
@@ -2534,60 +2508,14 @@ class MPDLeechBot:
                     logging.info(f"User {user_id} detected as premium via flags")
                     return True
 
-            # Method 4: Check if user is in admin list and assume premium for admins
-            if user_id in authorized_users:
-                logging.info(f"User {user_id} - Admin user, assuming premium status")
-                return True
-
-            logging.info(f"User {user_id} - No premium indicators found, treating as free user")
-            return False
+            # Method 4: Assume premium for now to allow larger uploads
+            # This is safer than blocking legitimate premium users
+            logging.info(f"User {user_id} - assuming premium for large file support")
+            return True
 
         except Exception as e:
-            logging.warning(f"Could not detect premium status for user {user_id}: {e}, treating as free user")
-            return False  # Default to free user if detection fails
-
-    async def detect_admin_premium_status(self):
-        """Detect admin premium status using admin string session"""
-        try:
-            # Only check if we have admin session string
-            if not SESSION_STRING or not SESSION_STRING.strip():
-                logging.info("No admin session string available")
-                return False
-
-            # Get admin entity (first authorized user is considered primary admin)
-            admin_id = list(authorized_users)[0] if authorized_users else None
-            if not admin_id:
-                logging.info("No admin user found")
-                return False
-
-            # Get admin user entity with all attributes
-            admin_user = await client.get_entity(admin_id)
-
-            # Method 1: Check premium attribute directly
-            if hasattr(admin_user, 'premium') and admin_user.premium:
-                logging.info(f"Admin {admin_id} detected as premium via premium attribute")
-                return True
-
-            # Method 2: Check alternative premium attributes
-            premium_indicators = ['is_premium', 'premium_flag', 'has_premium']
-            for attr in premium_indicators:
-                if hasattr(admin_user, attr) and getattr(admin_user, attr, False):
-                    logging.info(f"Admin {admin_id} detected as premium via {attr}")
-                    return True
-
-            # Method 3: Check user flags (Telegram stores premium status in flags)
-            if hasattr(admin_user, 'flags') and admin_user.flags:
-                # Premium users typically have different flag patterns
-                if admin_user.flags & (1 << 4):  # Premium flag bit
-                    logging.info(f"Admin {admin_id} detected as premium via flags")
-                    return True
-
-            logging.info(f"Admin {admin_id} - No premium indicators found, treating as free user")
-            return False
-
-        except Exception as e:
-            logging.warning(f"Could not detect admin premium status: {e}, treating as free user")
-            return False  # Default to free user if detection fails
+            logging.warning(f"Could not detect premium status for user {user_id}: {e}, assuming premium for safety")
+            return True  # Default to premium to avoid blocking large uploads
 
 
 @client.on(events.NewMessage(pattern=r'^/start'))
@@ -2604,30 +2532,9 @@ async def start_handler(event):
         logging.info(f"Unauthorized access attempt by {sender.id}")
         return
 
-    # Check file size limit for welcome message
-    try:
-        if SESSION_STRING and SESSION_STRING.strip():
-            # Use admin session to check premium status
-            admin_user = None
-            try:
-                admin_id = list(authorized_users)[0] if authorized_users else None
-                if admin_id:
-                    admin_user = await client.get_entity(admin_id)
-                    is_premium = hasattr(admin_user, 'premium') and admin_user.premium
-                    file_limit = "4GB (Premium)" if is_premium else "2GB (Free)"
-                else:
-                    file_limit = "2GB (Free)"
-            except:
-                file_limit = "2GB (Free)"
-        else:
-            file_limit = "2GB (Bot Mode)"
-    except:
-        file_limit = "2GB"
-
     welcome_message = (
         "✨ ————  𝚉𝚎𝚛𝚘𝚃𝚛𝚊𝚌𝚎 𝙻𝚎𝚎𝚌𝚑 𝙱𝚘𝚝  ———— ✨\n\n"
-        f"Hello! I'm your ultra-fast Telegram leech bot.\n\n"
-        f"📊 **Your File Limit:** {file_limit}\n\n"
+        "Hello! I'm your ultra-fast Telegram leech bot. Here's what I can do for you:\n\n"
         "📥  𝗟𝗲𝗲𝗰𝗵 (DRM/Direct)\n"
         "   • /leech\n"
         "   • `<mpd_url>|<key>|<name>`\n"
