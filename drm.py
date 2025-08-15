@@ -899,7 +899,7 @@ class MPDLeechBot:
             logging.error(f"mp4decrypt error: {str(e)}")
             raise
 
-    async def split_file(self, input_file, max_size_mb=1950, progress_cb=None, cancel_event=None):
+    async def split_file(self, input_file, max_size_mb=4000, progress_cb=None, cancel_event=None):
         """Split large files into chunks using FFmpeg segment splitting"""
         max_size = max_size_mb * 1024 * 1024  # Convert MB to bytes
         file_size = os.path.getsize(input_file)
@@ -1614,20 +1614,21 @@ class MPDLeechBot:
             self.progress_state['elapsed'] = 0
 
             # Set size limits based on session string availability first, then premium status
+            # Increased limits to match local Telegram behavior for large file uploads
             if admin_client and SESSION_STRING:
-                # When session string is available, use higher limits for better upload capability
-                max_size_mb = 3950  # 3.95GB when session string is available
-                max_size_bytes = int(3.95 * 1024 * 1024 * 1024)  # 3.95GB limit
+                # When session string is available, use maximum possible limits
+                max_size_mb = 4000  # 4GB when session string is available (close to Telegram's actual limit)
+                max_size_bytes = int(4.0 * 1024 * 1024 * 1024)  # 4GB limit
                 user_type = "SESSION"
                 logging.info(f"User {sender.id} using session string upload - max file size: {format_size(max_size_bytes)}")
             elif is_premium:
-                max_size_mb = 3980  # 3.98GB for premium users
-                max_size_bytes = int(3.98 * 1024 * 1024 * 1024)  # 3.98GB limit
+                max_size_mb = 4000  # 4GB for premium users (Telegram's actual limit)
+                max_size_bytes = int(4.0 * 1024 * 1024 * 1024)  # 4GB limit
                 user_type = "PREMIUM"
                 logging.info(f"User {sender.id} is premium, max file size: {format_size(max_size_bytes)}")
             else:
-                max_size_mb = 1950  # 1.95GB for free users
-                max_size_bytes = int(1.95 * 1024 * 1024 * 1024)  # 1.95GB limit
+                max_size_mb = 2000  # 2GB for free users (Telegram's actual limit)
+                max_size_bytes = int(2.0 * 1024 * 1024 * 1024)  # 2GB limit
                 user_type = "FREE"
                 logging.info(f"User {sender.id} is free user, max file size: {format_size(max_size_bytes)}")
 
@@ -1702,8 +1703,8 @@ class MPDLeechBot:
                     except Exception as e:
                         logging.error(f"Error in splitting progress callback: {e}")
 
-                # Split file with proper size limits (use 3950MB when session string is available)
-                split_size_mb = 3950 if (admin_client and SESSION_STRING) else max_size_mb
+                # Split file with proper size limits (use 4000MB when session string is available)
+                split_size_mb = 4000 if (admin_client and SESSION_STRING) else max_size_mb
                 chunks = await self.split_file(
                     filepath,
                     max_size_mb=split_size_mb,
@@ -1735,28 +1736,18 @@ class MPDLeechBot:
                     part_size = 524288  # 512KB chunks for Telegram
                     total_parts = (chunk_size + part_size - 1) // part_size
 
-                    # Calculate optimal part size for large files
-                    # For 3.8GB+ files, we need larger parts to stay under 4000 part limit
-                    min_part_size = 1024 * 1024  # 1MB minimum
-                    max_part_size = 512 * 1024 * 1024  # 512MB maximum (Telegram limit)
-                    
-                    # Calculate required part size to stay under 4000 parts
-                    required_part_size = (chunk_size + 3999) // 4000
-                    
-                    # Round up to nearest 1MB for efficiency
-                    optimal_part_size = ((required_part_size + 1024 * 1024 - 1) // (1024 * 1024)) * (1024 * 1024)
-                    
-                    # Ensure part size is within limits
-                    part_size = max(min_part_size, min(optimal_part_size, max_part_size))
-                    
-                    # Recalculate total parts with optimal size
+                    # Use larger part size for better performance - Telegram supports up to 512KB per part
+                    # but we can use fewer, larger parts for better upload efficiency
+                    part_size = 512 * 1024  # 512KB parts (Telegram's maximum)
                     total_parts = (chunk_size + part_size - 1) // part_size
                     
-                    # Final validation
+                    # Telegram allows up to 4000 parts per file, which gives us ~2GB max per chunk at 512KB/part
+                    # This matches how local Telegram handles large files
                     if total_parts > 4000:
-                        # If still too many parts, use maximum allowed part size
-                        part_size = max_part_size
-                        total_parts = (chunk_size + part_size - 1) // part_size
+                        logging.error(f"Chunk too large: {total_parts} parts needed, max 4000 allowed")
+                        raise Exception(f"Chunk {format_size(chunk_size)} exceeds Telegram's 4000-part limit")
+                    
+                    logging.info(f"Uploading chunk with {format_size(part_size)} parts: {total_parts} parts total")
                         
                     if total_parts <= 0 or total_parts > 4000:
                         logging.error(f"CRITICAL: Cannot upload chunk {i+1}: {total_parts} parts (chunk_size: {chunk_size}, part_size: {part_size})")
@@ -2078,7 +2069,7 @@ class MPDLeechBot:
                 # Check if this is from JSON processing by looking at the task source
                 is_json_batch = hasattr(self, '_is_json_batch') and self._is_json_batch
                 if not is_json_batch:
-                    split_info = f"{split_size_mb}MB each" if admin_client and SESSION_STRING else "1900MB each"
+                    split_info = f"{split_size_mb}MB each"
                     await send_message_with_flood_control(
                         entity=event.chat_id,
                         message=f"🎉 **Upload Complete!**\n\n"
@@ -2123,26 +2114,16 @@ class MPDLeechBot:
                 part_size = 524288  # 512KB chunks
                 total_parts = (file_size + part_size - 1) // part_size
 
-                # Calculate optimal part size for large single files
-                min_part_size = 1024 * 1024  # 1MB minimum
-                max_part_size = 512 * 1024 * 1024  # 512MB maximum
-                
-                # Calculate required part size to stay under 4000 parts
-                required_part_size = (file_size + 3999) // 4000
-                
-                # Round up to nearest 1MB for efficiency
-                optimal_part_size = ((required_part_size + 1024 * 1024 - 1) // (1024 * 1024)) * (1024 * 1024)
-                
-                # Ensure part size is within limits
-                part_size = max(min_part_size, min(optimal_part_size, max_part_size))
-                
-                # Recalculate total parts with optimal size
+                # Use optimal part size for single file upload
+                part_size = 512 * 1024  # 512KB parts (Telegram's maximum)
                 total_parts = (file_size + part_size - 1) // part_size
                 
-                # Final validation
+                # Telegram's limit is 4000 parts per file
                 if total_parts > 4000:
-                    part_size = max_part_size
-                    total_parts = (file_size + part_size - 1) // part_size
+                    logging.error(f"File too large: {total_parts} parts needed, max 4000 allowed")
+                    raise Exception(f"File {format_size(file_size)} exceeds Telegram's 4000-part limit")
+                
+                logging.info(f"Single file upload: {format_size(part_size)} parts, {total_parts} total parts")
 
                 if total_parts <= 0 or total_parts > 4000:
                     raise Exception(f"CRITICAL: Cannot upload file: {total_parts} parts (file_size: {file_size}, part_size: {part_size})")
@@ -2937,7 +2918,7 @@ async def leech_handler(event):
                 for i, task in enumerate(tasks_to_add, start_position):
                     queue_message += f"Task {i}: {task['name']}.mp4 (Position {i}/{len(user_queue)})\n"
             else:
-                # Show summary for large batches
+                # Show su�mmary for large batches
                 queue_message = f"Added {len(tasks_to_add)} task(s) to your queue:\n"
                 start_position = len(user_queue) - len(tasks_to_add) + 1
                 # Show first 5 tasks
@@ -3116,7 +3097,7 @@ async def loadjson_handler(event):
 
 @client.on(events.NewMessage())
 async def json_data_handler(event):
-    """Handle JSON file uploads and JSON text input"""
+    """H�andle JSON file uploads and JSON text input"""
     sender = await event.get_sender()
 
     # Only process JSON from authorized users
@@ -3309,7 +3290,7 @@ async def processjson_handler(event):
                             tasks_to_add.append(task)
                             logging.info(f"Added direct task (explicit) from JSON: {name}")
 
-                    if not tasks_to_add or len(tasks_to_add) == 0 or tasks_to_add[-1]['name'] != name:
+                    if �not tasks_to_add or len(tasks_to_add) == 0 or tasks_to_add[-1]['name'] != name:
                         invalid_items.append(f"Item {i}: No valid content detected (need mpd_url+keys or url)")
 
             except Exception as e:
@@ -3516,7 +3497,7 @@ async def removeadmin_handler(event):
     # Only allow existing authorized users to remove admins
     if sender.id not in authorized_users:
         await send_message_with_flood_control(
-            entity=event.chat_id,
+            entity=event�.chat_id,
             message="You're not authorized to remove admins.",
             event=event
         )
@@ -3705,7 +3686,7 @@ async def perform_internet_speed_test():
             try:
                 upload_data = b'0' * (5 * 1024 * 1024)  # 5MB fallback
                 url = "https://httpbin.org/post"
-                headers = {'User-Agent': 'SpeedTest/1.0', 'Content-Type': 'application/octet-stream'}
+           �     headers = {'User-Agent': 'SpeedTest/1.0', 'Content-Type': 'application/octet-stream'}
                 timeout = aiohttp.ClientTimeout(total=max_test_time)
 
                 start_time = time.time()
@@ -3899,7 +3880,7 @@ async def speed_handler(event):
                     f"📄 {filename}\n"
                     f"{speed_emoji} **{speed_type}:** {format_size(current_speed)}/s\n"
                     f"📈 **Progress:** {percent:.1f}%\n"
-                    f"📦 {format_size(done)} / {format_size(total)}\n"
+    �                f"📦 {format_size(done)} / {format_size(total)}\n"
                     f"⏱️ {format_time(elapsed)}"
                 )
             else:
@@ -4075,7 +4056,7 @@ async def processbulk_handler(event):
                 bot = MPDLeechBot(sender.id)
                 bot._is_json_batch = True # Mark this instance as processing a JSON batch
                 user_bot_instances[sender.id] = bot
-                user_active_tasks[sender.id] = asyncio.create_task(bot.process_queue(event))
+                user_active_tasks[sender.id�] = asyncio.create_task(bot.process_queue(event))
 
             # Wait for this JSON to complete before starting next
             while user_states.get(sender.id, False) or (user_active_tasks.get(sender.id) and not user_active_tasks[sender.id].done()):
