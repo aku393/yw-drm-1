@@ -105,29 +105,8 @@ speed_lock = asyncio.Lock()  # Lock for speed tracking
 user_bulk_data = {}  # Format: {user_id: [json_data1, json_data2, ...]}
 bulk_lock = asyncio.Lock()  # Lock for bulk processing
 
-# Thumbnail storage for users
-user_thumbnails = {}  # Format: {user_id: thumbnail_file_path}
-thumbnail_lock = asyncio.Lock()  # Lock for thumbnail management
-
-# Speed tracking for users
-user_speed_stats = {}  # Format: {user_id: {'download_speed': float, 'upload_speed': float, 'last_updated': timestamp}}
-speed_lock = asyncio.Lock()  # Lock for speed tracking
-
-# Bulk JSON processing storage
-user_bulk_data = {}  # Format: {user_id: [json_data1, json_data2, ...]}
-bulk_lock = asyncio.Lock()  # Lock for bulk processing
-
-# Thumbnail storage for users
-user_thumbnails = {}  # Format: {user_id: thumbnail_file_path}
-thumbnail_lock = asyncio.Lock()  # Lock for thumbnail management
-
-# Speed tracking for users
-user_speed_stats = {}  # Format: {user_id: {'download_speed': float, 'upload_speed': float, 'last_updated': timestamp}}
-speed_lock = asyncio.Lock()  # Lock for speed tracking
-
-# Bulk JSON processing storage
-user_bulk_data = {}  # Format: {user_id: [json_data1, json_data2, ...]}
-bulk_lock = asyncio.Lock()  # Lock for bulk processing
+# Thumbnail generation directory
+THUMBNAIL_DIR = os.path.join(DOWNLOAD_DIR, "thumbnails")
 
 # Download and extract Bento4 SDK if not present
 def setup_bento4():
@@ -235,15 +214,42 @@ except Exception as e:
     raise
 
 # Initialize Telegram client
-if SESSION_STRING and SESSION_STRING.strip():
+# The main client instance will be used for bot operations (receiving messages)
+# User-specific clients will be created when needed for uploads via session string
+client = TelegramClient('bot', API_ID, API_HASH, connection_retries=5, auto_reconnect=True)
+main_client = client  # Keep reference for backwards compatibility
+# User clients will be stored here, mapped by user_id
+user_clients = {} # {user_id: TelegramClient}
+
+# Helper function to get or create a user client
+async def get_user_client(user_id):
+    if user_id in user_clients and user_clients[user_id].is_connected():
+        return user_clients[user_id]
+
+    session_str = None
+    # Ideally, the session string would be securely stored and retrieved per user.
+    # For this example, we assume it's available globally or can be passed.
+    # In a real-world scenario, you'd likely load user sessions from a database.
+    # As a fallback, if SESSION_STRING is provided, we use that.
+    if SESSION_STRING and SESSION_STRING.strip():
+        session_str = SESSION_STRING.strip()
+    else:
+        # If no global session string is available, you might need to prompt the user
+        # to log in or use a user API key, but that's beyond this example's scope.
+        raise ConnectionError("No user session string available. Cannot create user client.")
+
     try:
-        session = StringSession(SESSION_STRING.strip())
-        client = TelegramClient(session, API_ID, API_HASH, connection_retries=5, auto_reconnect=True)
+        session = StringSession(session_str)
+        client_instance = TelegramClient(session, API_ID, API_HASH, connection_retries=5, auto_reconnect=True)
+        await client_instance.connect()
+        # Verify connection by getting user info
+        await client_instance.get_me()
+        user_clients[user_id] = client_instance
+        logging.info(f"User client created and connected for user {user_id}")
+        return client_instance
     except Exception as e:
-        print(f"Session error: {e}, using bot token")
-        client = TelegramClient('bot', API_ID, API_HASH, connection_retries=5, auto_reconnect=True)
-else:
-    client = TelegramClient('bot', API_ID, API_HASH, connection_retries=5, auto_reconnect=True)
+        logging.error(f"Failed to create or connect user client for user {user_id}: {e}")
+        raise ConnectionError(f"Failed to connect user client: {e}")
 
 # Helper function to get user-specific locks and queues
 def get_user_resources(user_id):
@@ -264,13 +270,13 @@ user_message_cache = {}      # Cache last message content to avoid duplicate edi
 
 # Helper function to handle flood wait errors and throttle message sends
 async def send_message_with_flood_control(entity, message, event=None, edit_message=None):
-    # Extract user ID for tracking
+    # Determine user_id for logging and rate limiting
     user_id = None
     if event and hasattr(event, 'sender_id'):
         user_id = event.sender_id
-    elif hasattr(entity, 'id'):
+    elif hasattr(entity, 'id'): # If entity is a user/chat object
         user_id = entity.id
-    elif edit_message and hasattr(edit_message, 'sender_id'):
+    elif edit_message and hasattr(edit_message, 'sender_id'): # For editing a message from a user
         user_id = edit_message.sender_id
 
     max_retries = 3
@@ -295,6 +301,7 @@ async def send_message_with_flood_control(entity, message, event=None, edit_mess
                         sleep_time = adaptive_delay - time_since_last
                         await asyncio.sleep(sleep_time)
                 else:
+                    # For bot messages or unknown sender, use base delay
                     await asyncio.sleep(base_delay)
 
                 # Check for duplicate message content to avoid unnecessary edits
@@ -325,7 +332,8 @@ async def send_message_with_flood_control(entity, message, event=None, edit_mess
                     if event:
                         result = await event.reply(message)
                     else:
-                        result = await client.send_message(entity, message)
+                        # Use main_client for bot messages if no event is provided
+                        result = await main_client.send_message(entity, message)
                     if user_id:
                         user_last_message_time[user_id] = time.time()
                     # Reduce flood penalty on success
@@ -334,7 +342,6 @@ async def send_message_with_flood_control(entity, message, event=None, edit_mess
                     return result
 
             except FloodWaitError as e:
-                # More aggressive FloodWaitError handling
                 actual_wait_time = e.seconds
                 retry_count += 1
 
@@ -1123,7 +1130,7 @@ class MPDLeechBot:
             async def fetch_mpd_operation():
                 async with aiohttp.ClientSession() as session:
                     logging.info(f"Fetching MPD: {mpd_url}")
-                    async with session.get(mpd_url, headers=headers) as response:
+                    async with session.get(mpd_url, headers=headers, allow_redirects=True) as response:
                         if response.status == 403:
                             raise Exception(f"403 Forbidden: {mpd_url}")
                         if response.status not in [200, 206]:
@@ -1341,7 +1348,8 @@ class MPDLeechBot:
                                         last_significant_update = current_time
                                         last_content_hash = content_hash
                                         consecutive_identical = 0
-                                        logging.info(f"Progress updated for user {user_id}: {self.progress_state['stage']} - {self.progress_state['percent']:.1f}%")
+                                        logging.info(f"Progress updated for user {user_id}: {self.progress_state['percent']:.1f}%")
+
                                     else:
                                         # Failed to update, try again next cycle
                                         await asyncio.sleep(1)
@@ -1676,7 +1684,8 @@ class MPDLeechBot:
 
                     # Generate unique file ID for each chunk
                     file_id = random.getrandbits(63)
-                    part_size = 524288  # 512KB chunks for Telegram
+                    # Optimize chunk size for user session uploads
+                    part_size = 1048576  # 1MB chunks for better performance with user sessions
                     total_parts = (chunk_size + part_size - 1) // part_size
 
                     if total_parts <= 0:
@@ -1689,7 +1698,9 @@ class MPDLeechBot:
 
                     async def upload_part_fast(file_id, part_num, part_size, total_parts, chunk_path, progress, semaphore):
                         async with semaphore:
-                            retries = 3
+                            retries = 5  # Increased retries for large files
+                            base_delay = 2  # Base delay for exponential backoff
+
                             for attempt in range(retries):
                                 try:
                                     with open(chunk_path, 'rb') as f:
@@ -1701,11 +1712,14 @@ class MPDLeechBot:
                                     if not data:
                                         return (part_num, False, "No data")
 
-                                    # Add timeout for individual part uploads
-                                    upload_timeout = 60 if len(data) > 512 * 1024 else 30
+                                    # Adaptive timeout based on data size and attempt number
+                                    base_timeout = 120 if len(data) > 1024 * 1024 else 60  # 2min for >1MB, 1min for smaller
+                                    upload_timeout = base_timeout * (attempt + 1)  # Increase timeout on retries
 
+                                    # Update upload methods to use user session client
+                                    upload_client = await get_user_client(sender.id)
                                     result = await asyncio.wait_for(
-                                        client(SaveBigFilePartRequest(
+                                        upload_client(SaveBigFilePartRequest(
                                             file_id=file_id,
                                             file_part=part_num,
                                             file_total_parts=total_parts,
@@ -1719,16 +1733,44 @@ class MPDLeechBot:
                                         return (part_num, True, None)
                                     else:
                                         if attempt < retries - 1:
-                                            await asyncio.sleep(1 * (attempt + 1))  # Longer backoff
+                                            delay = base_delay * (2 ** attempt)  # Exponential backoff: 2s, 4s, 8s, 16s
+                                            logging.warning(f"Part {part_num}/{total_parts} upload returned False, retrying in {delay}s (attempt {attempt + 1}/{retries})")
+                                            await asyncio.sleep(delay)
                                             continue
-                                        return (part_num, False, "Upload returned False")
+                                        return (part_num, False, "Upload returned False after all retries")
+
+                                except asyncio.TimeoutError:
+                                    if attempt < retries - 1:
+                                        delay = base_delay * (2 ** attempt)
+                                        logging.warning(f"Part {part_num}/{total_parts} upload timeout, retrying in {delay}s (attempt {attempt + 1}/{retries})")
+                                        await asyncio.sleep(delay)
+                                        continue
+                                    return (part_num, False, f"Upload timeout after {retries} attempts")
 
                                 except Exception as e:
-                                    if attempt < retries - 1:
-                                        logging.warning(f"Part {part_num} upload attempt {attempt + 1} failed: {e}, retrying...")
-                                        await asyncio.sleep(1 * (attempt + 1)) # Longer backoff
-                                        continue
-                                    return (part_num, False, str(e))
+                                    error_msg = str(e)
+                                    # Handle specific Telegram errors
+                                    if "FILE_PARTS_INVALID" in error_msg:
+                                        return (part_num, False, f"Invalid file parts: total_parts={total_parts}, current_part={part_num}")
+                                    elif "FILE_PART_TOO_BIG" in error_msg:
+                                        return (part_num, False, f"File part too big: {len(data)} bytes")
+                                    elif "FLOOD_WAIT" in error_msg:
+                                        if attempt < retries - 1:
+                                            # Extract wait time from error if possible
+                                            import re
+                                            wait_match = re.search(r'FLOOD_WAIT_(\d+)', error_msg)
+                                            wait_time = int(wait_match.group(1)) if wait_match else 30
+                                            logging.warning(f"Part {part_num}/{total_parts} flood wait {wait_time}s, waiting...")
+                                            await asyncio.sleep(wait_time + 5)  # Add 5s buffer
+                                            continue
+                                        return (part_num, False, f"Flood wait error: {error_msg}")
+                                    else:
+                                        if attempt < retries - 1:
+                                            delay = base_delay * (2 ** attempt)
+                                            logging.warning(f"Part {part_num}/{total_parts} upload error: {error_msg}, retrying in {delay}s (attempt {attempt + 1}/{retries})")
+                                            await asyncio.sleep(delay)
+                                            continue
+                                        return (part_num, False, error_msg)
 
                             return (part_num, False, "Max retries exceeded")
 
@@ -1777,6 +1819,11 @@ class MPDLeechBot:
                                         status_msg = result
                                         last_update_time = current_time
                                         logging.debug(f"Progress updated: {current_percent:.1f}% (Part {i+1}/{total_chunks})")
+
+                                    else:
+                                        # Failed to update, try again next cycle
+                                        await asyncio.sleep(1)
+                                        continue
 
                             except Exception as e:
                                 logging.warning(f"Progress update failed: {e}")
@@ -1844,23 +1891,69 @@ class MPDLeechBot:
                         async with self.update_lock:
                             status_msg = await send_message_with_flood_control(entity=event.chat_id, message=display, edit_message=status_msg)
 
+                        # Get video metadata for proper attributes
+                        video_duration = 0
+                        video_width = 1280
+                        video_height = 720
+
+                        try:
+                            # Extract metadata from the chunk
+                            metadata_cmd = [
+                                'ffprobe', '-v', 'quiet', '-print_format', 'json',
+                                '-show_format', '-show_streams', chunk
+                            ]
+                            process = await asyncio.create_subprocess_exec(
+                                *metadata_cmd,
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE
+                            )
+                            stdout, stderr = await process.communicate()
+
+                            if process.returncode == 0:
+                                metadata = json.loads(stdout.decode())
+                                for stream in metadata.get('streams', []):
+                                    if stream.get('codec_type') == 'video':
+                                        video_width = stream.get('width', 1280)
+                                        video_height = stream.get('height', 720)
+                                        break
+
+                                # Get duration from format
+                                format_info = metadata.get('format', {})
+                                if 'duration' in format_info:
+                                    video_duration = int(float(format_info['duration']))
+
+                        except Exception as e:
+                            logging.warning(f"Failed to extract video metadata: {e}")
+
                         # Send the file
                         async def send_file_operation():
+                            # Update upload methods to use user session client
+                            upload_client = await get_user_client(sender.id)
                             if thumbnail_file and os.path.exists(thumbnail_file):
-                                return await client.send_file(
+                                return await upload_client.send_file(
                                     event.chat_id,
                                     file=input_file_big,
                                     caption=f"Part {i+1}/{total_chunks}: {os.path.basename(filepath)}",
                                     thumb=thumbnail_file,
-                                    attributes=[DocumentAttributeVideo(duration=0, w=1280, h=720, supports_streaming=True)],
+                                    attributes=[DocumentAttributeVideo(
+                                        duration=video_duration,
+                                        w=video_width,
+                                        h=video_height,
+                                        supports_streaming=True
+                                    )],
                                     force_document=False
                                 )
                             else:
-                                return await client.send_file(
+                                return await upload_client.send_file(
                                     event.chat_id,
                                     file=input_file_big,
                                     caption=f"Part {i+1}/{total_chunks}: {os.path.basename(filepath)}",
-                                    attributes=[DocumentAttributeVideo(duration=0, w=1280, h=720, supports_streaming=True)],
+                                    attributes=[DocumentAttributeVideo(
+                                        duration=video_duration,
+                                        w=video_width,
+                                        h=video_height,
+                                        supports_streaming=True
+                                    )],
                                     force_document=False
                                 )
 
@@ -1904,7 +1997,8 @@ class MPDLeechBot:
                         entity=event.chat_id,
                         message=f"🎉 **Upload Complete!**\n\n"
                                f"📁 File: {os.path.basename(filepath)}\n"
-                               f"✂️ Split into: {len(uploaded_chunks)} parts (1900MB each)\n"
+                               f"✂️ Split into: {len(uploaded_chunks)} parts ({max_size_mb}MB each)\n"
+                               f"👤 User Type: {user_type}\n"
                                f"📊 Total Size: {format_size(file_size)}\n"
                                f"⚡ Average Speed: {format_size(avg_speed)}/s\n"
                                f"⏱️ Total Time: {format_time(total_upload_time)}\n"
@@ -1941,7 +2035,8 @@ class MPDLeechBot:
 
                 # Generate unique file ID
                 file_id = random.getrandbits(63)
-                part_size = 524288  # 512KB chunks
+                # Optimize chunk size for user session uploads
+                part_size = 1048576  # 1MB chunks for better performance with user sessions
                 total_parts = (file_size + part_size - 1) // part_size
 
                 if total_parts <= 0:
@@ -1954,7 +2049,9 @@ class MPDLeechBot:
 
                 async def upload_part_single(file_id, part_num, part_size, total_parts, file_path, progress, semaphore):
                     async with semaphore:
-                        retries = 3
+                        retries = 5  # Increased retries for large files
+                        base_delay = 2  # Base delay for exponential backoff
+
                         for attempt in range(retries):
                             try:
                                 with open(file_path, 'rb') as f:
@@ -1966,11 +2063,14 @@ class MPDLeechBot:
                                     if not data:
                                         return (part_num, False, "No data")
 
-                                    # Add timeout for individual part uploads
-                                    upload_timeout = 60 if len(data) > 512 * 1024 else 30
+                                    # Adaptive timeout based on data size and attempt number
+                                    base_timeout = 120 if len(data) > 1024 * 1024 else 60  # 2min for >1MB, 1min for smaller
+                                    upload_timeout = base_timeout * (attempt + 1)  # Increase timeout on retries
 
+                                    # Update upload methods to use user session client
+                                    upload_client = await get_user_client(sender.id)
                                     result = await asyncio.wait_for(
-                                        client(SaveBigFilePartRequest(
+                                        upload_client(SaveBigFilePartRequest(
                                             file_id=file_id,
                                             file_part=part_num,
                                             file_total_parts=total_parts,
@@ -1984,16 +2084,44 @@ class MPDLeechBot:
                                         return (part_num, True, None)
                                     else:
                                         if attempt < retries - 1:
-                                            await asyncio.sleep(1 * (attempt + 1))  # Longer backoff
+                                            delay = base_delay * (2 ** attempt)  # Exponential backoff: 2s, 4s, 8s, 16s
+                                            logging.warning(f"Part {part_num}/{total_parts} upload returned False, retrying in {delay}s (attempt {attempt + 1}/{retries})")
+                                            await asyncio.sleep(delay)
                                             continue
-                                        return (part_num, False, "Upload returned False")
+                                        return (part_num, False, "Upload returned False after all retries")
+
+                            except asyncio.TimeoutError:
+                                if attempt < retries - 1:
+                                    delay = base_delay * (2 ** attempt)
+                                    logging.warning(f"Part {part_num}/{total_parts} upload timeout, retrying in {delay}s (attempt {attempt + 1}/{retries})")
+                                    await asyncio.sleep(delay)
+                                    continue
+                                return (part_num, False, f"Upload timeout after {retries} attempts")
 
                             except Exception as e:
-                                if attempt < retries - 1:
-                                    logging.warning(f"Part {part_num} upload attempt {attempt + 1} failed: {e}, retrying...")
-                                    await asyncio.sleep(1 * (attempt + 1)) # Longer backoff
-                                    continue
-                                return (part_num, False, str(e))
+                                error_msg = str(e)
+                                # Handle specific Telegram errors
+                                if "FILE_PARTS_INVALID" in error_msg:
+                                    return (part_num, False, f"Invalid file parts: total_parts={total_parts}, current_part={part_num}")
+                                elif "FILE_PART_TOO_BIG" in error_msg:
+                                    return (part_num, False, f"File part too big: {len(data)} bytes")
+                                elif "FLOOD_WAIT" in error_msg:
+                                    if attempt < retries - 1:
+                                        # Extract wait time from error if possible
+                                        import re
+                                        wait_match = re.search(r'FLOOD_WAIT_(\d+)', error_msg)
+                                        wait_time = int(wait_match.group(1)) if wait_match else 30
+                                        logging.warning(f"Part {part_num}/{total_parts} flood wait {wait_time}s, waiting...")
+                                        await asyncio.sleep(wait_time + 5)  # Add 5s buffer
+                                        continue
+                                    return (part_num, False, f"Flood wait error: {error_msg}")
+                                else:
+                                    if attempt < retries - 1:
+                                        delay = base_delay * (2 ** attempt)
+                                        logging.warning(f"Part {part_num}/{total_parts} upload error: {error_msg}, retrying in {delay}s (attempt {attempt + 1}/{retries})")
+                                        await asyncio.sleep(delay)
+                                        continue
+                                    return (part_num, False, error_msg)
 
                         return (part_num, False, "Max retries exceeded")
 
@@ -2105,23 +2233,70 @@ class MPDLeechBot:
                     async with self.update_lock:
                         status_msg = await send_message_with_flood_control(entity=event.chat_id, message=display, edit_message=status_msg)
 
+                    # Get proper video metadata for single file
+                    video_width = 1280
+                    video_height = 720
+                    video_duration = duration if duration > 0 else 0
+
+                    try:
+                        # Extract detailed metadata
+                        metadata_cmd = [
+                            'ffprobe', '-v', 'quiet', '-print_format', 'json',
+                            '-show_format', '-show_streams', filepath
+                        ]
+                        process = await asyncio.create_subprocess_exec(
+                            *metadata_cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        )
+                        stdout, stderr = await process.communicate()
+
+                        if process.returncode == 0:
+                            metadata = json.loads(stdout.decode())
+                            for stream in metadata.get('streams', []):
+                                if stream.get('codec_type') == 'video':
+                                    video_width = stream.get('width', 1280)
+                                    video_height = stream.get('height', 720)
+                                    break
+
+                            # Get duration from format if not already available
+                            if video_duration == 0:
+                                format_info = metadata.get('format', {})
+                                if 'duration' in format_info:
+                                    video_duration = int(float(format_info['duration']))
+
+                    except Exception as e:
+                        logging.warning(f"Failed to extract video metadata: {e}")
+
                     # Send the file
                     async def send_single_file_operation():
+                        # Update upload methods to use user session client
+                        upload_client = await get_user_client(sender.id)
                         if thumbnail_file and os.path.exists(thumbnail_file):
-                            return await client.send_file(
+                            return await upload_client.send_file(
                                 event.chat_id,
                                 file=input_file_big,
                                 caption=f"{os.path.basename(filepath)}",
                                 thumb=thumbnail_file,
-                                attributes=[DocumentAttributeVideo(duration=duration, w=1280, h=720, supports_streaming=True)],
+                                attributes=[DocumentAttributeVideo(
+                                    duration=video_duration,
+                                    w=video_width,
+                                    h=video_height,
+                                    supports_streaming=True
+                                )],
                                 force_document=False
                             )
                         else:
-                            return await client.send_file(
+                            return await upload_client.send_file(
                                 event.chat_id,
                                 file=input_file_big,
                                 caption=f"{os.path.basename(filepath)}",
-                                attributes=[DocumentAttributeVideo(duration=duration, w=1280, h=720, supports_streaming=True)],
+                                attributes=[DocumentAttributeVideo(
+                                    duration=video_duration,
+                                    w=video_width,
+                                    h=video_height,
+                                    supports_streaming=True
+                                )],
                                 force_document=False
                             )
 
@@ -2162,9 +2337,12 @@ class MPDLeechBot:
                             entity=event.chat_id,
                             message=f"🎉 **Upload Complete!**\n\n"
                                    f"📁 File: {os.path.basename(filepath)}\n"
-                                   f"📊 Size: {format_size(file_size)}\n"
-                                   f"⚡ Speed: {format_size(upload_speed)}/s\n"
-                                   f"⏱️ Time: {format_time(elapsed)}",
+                                   f"✂️ Split into: {len(uploaded_chunks)} parts ({max_size_mb}MB each)\n"
+                                   f"👤 User Type: {user_type}\n"
+                                   f"📊 Total Size: {format_size(file_size)}\n"
+                                   f"⚡ Average Speed: {format_size(avg_speed)}/s\n"
+                                   f"⏱️ Total Time: {format_time(total_upload_time)}\n"
+                                   f"🧹 Cleanup: Complete",
                             event=event
                         )
 
@@ -2782,460 +2960,6 @@ async def clear_handler(event):
             event=event
         )
 
-@client.on(events.NewMessage(pattern=r'^/loadjson'))
-async def loadjson_handler(event):
-    sender = await event.get_sender()
-    logging.info(f"Received /loadjson command from user {sender.id}")
-
-    if sender.id not in authorized_users:
-        await send_message_with_flood_control(
-            entity=event.chat_id,
-            message="You're not authorized.",
-            event=event
-        )
-        return
-
-    await send_message_with_flood_control(
-        entity=event.chat_id,
-        message="📥 Ready to receive JSON data!\n\nYou can:\n1. Upload a .json file\n2. Send JSON text directly\n\n**Auto-Detection Formats:**\n```json\n[\n  {\n    \"video_name\": \"Pleural Effusion\",\n    \"mpd_url\": \"https://example.com/manifest.mpd\",\n    \"keys\": [\"kid:key\"]\n  },\n  {\n    \"name\": \"Direct Video\",\n    \"url\": \"https://example.com/video.mp4\"\n  }\n]\n```\n\n**Features:**\n• Auto-detects DRM (mpd_url + keys) vs Direct (url)\n• Supports both `video_name` and `name` fields\n• No `type` field required!\n\nAfter sending JSON, use `/processjson` to start processing!",
-        event=event
-    )
-
-@client.on(events.NewMessage())
-async def json_data_handler(event):
-    """Handle JSON file uploads and JSON text input"""
-    sender = await event.get_sender()
-
-    # Only process JSON from authorized users
-    if sender.id not in authorized_users:
-        return
-
-    # Ignore commands and messages not starting with JSON syntax
-    if event.text and (event.text.strip().startswith('/') or not (event.text.strip().startswith('[') or event.text.strip().startswith('{'))):
-        return
-
-    try:
-        json_data = None
-        filename = None
-
-        # Check if it's a file upload
-        if event.document and event.document.mime_type == 'application/json':
-            logging.info(f"JSON file uploaded by user {sender.id}")
-
-            # Get filename
-            for attr in getattr(event.document, 'attributes', []):
-                if hasattr(attr, 'file_name'):
-                    filename = attr.file_name
-                    break
-            filename = filename or f"upload_{int(time.time())}.json"
-
-            # Download and parse the file
-            file_path = await event.download_media()
-            with open(file_path, 'r', encoding='utf-8') as f:
-                json_data = json.loads(f.read())
-            os.remove(file_path)
-
-        # Check if it's JSON text (starts with [ or {)
-        elif event.text and (event.text.strip().startswith('[') or event.text.strip().startswith('{')):
-            logging.info(f"JSON text received from user {sender.id}")
-            json_data = json.loads(event.text.strip())
-            filename = f"text_input_{int(time.time())}.json"
-
-        # Process JSON data if found
-        if json_data:
-            item_count = len(json_data)
-
-            # Check if user is in bulk mode
-            async with bulk_lock:
-                is_bulk_mode = sender.id in user_bulk_data
-
-            if is_bulk_mode:
-                # Bulk mode - add to bulk data
-                user_bulk_data[sender.id].append(json_data)
-                total_bulk = len(user_bulk_data[sender.id])
-                await event.reply(f"📦 **Bulk #{total_bulk}:** {item_count} items ({filename})\n\nUse `/processbulk` to start or send more JSON files.")
-            else:
-                # Regular mode - store and send quick response
-                async with json_lock:
-                    user_json_data[sender.id] = json_data
-                await event.reply(f"✅ **JSON Loaded:** {item_count} items from {filename}\n\n📋 Use `/processjson all` to process all items\n**Range:** 1-{len(json_data)}")
-
-            logging.info(f"JSON processed for user {sender.id}: {item_count} items")
-
-    except json.JSONDecodeError as e:
-        await event.reply(f"❌ Invalid JSON: {str(e)}")
-    except Exception as e:
-        logging.error(f"JSON processing error for user {sender.id}: {str(e)}")
-        await event.reply(f"❌ Error: {str(e)}")
-
-@client.on(events.NewMessage(pattern=r'^/processjson(?:\s+(.+))?'))
-async def processjson_handler(event):
-    sender = await event.get_sender()
-    range_input = event.pattern_match.group(1)
-    logging.info(f"Received /processjson command from user {sender.id} with range: {range_input}")
-
-    if sender.id not in authorized_users:
-        await send_message_with_flood_control(
-            entity=event.chat_id,
-            message="You're not authorized.",
-            event=event
-        )
-        return
-
-    async with json_lock:
-        if sender.id not in user_json_data:
-            await send_message_with_flood_control(
-                entity=event.chat_id,
-                message="❌ No JSON data found. Use /loadjson first to load JSON data.",
-                event=event
-            )
-            return
-
-        json_data = user_json_data[sender.id]
-
-    # Handle range selection
-    if not range_input:
-        await send_message_with_flood_control(
-            entity=event.chat_id,
-            message=f"📋 **JSON Data Loaded: {len(json_data)} items**\n\nPlease specify range:\n\n**Examples:**\n• `/processjson all` - Process all items\n• `/processjson 1-10` - Process items 1 to 10\n• `/processjson 5` - Process only item 1\n\n**Current range: 1-{len(json_data)}**",
-            event=event
-        )
-        return
-
-    # Parse range input
-    try:
-        if range_input.lower() == "all":
-            start_idx, end_idx = 0, len(json_data)
-            selected_data = json_data
-        elif "-" in range_input:
-            start, end = map(int, range_input.split("-"))
-            start_idx, end_idx = start - 1, end  # Convert to 0-based indexing
-            if start_idx < 0 or end_idx > len(json_data) or start_idx >= end_idx:
-                raise ValueError("Invalid range")
-            selected_data = json_data[start_idx:end_idx]
-        else:
-            item_num = int(range_input)
-            start_idx, end_idx = item_num - 1, item_num
-            if start_idx < 0 or start_idx >= len(json_data):
-                raise ValueError("Invalid item number")
-            selected_data = [json_data[start_idx]]
-    except (ValueError, IndexError):
-        await send_message_with_flood_control(
-            entity=event.chat_id,
-            message=f"❌ Invalid range format. Use:\n• `all` for all items\n• `1-10` for range\n• `5` for single item\n\nValid range: 1-{len(json_data)}",
-            event=event
-        )
-        return
-
-    user_queue, user_states, user_lock = get_user_resources(sender.id)
-
-    try:
-        tasks_to_add = []
-        invalid_items = []
-
-        for i, item in enumerate(selected_data, start_idx + 1):
-            try:
-                # Support both 'name' and 'video_name' fields
-                name = item.get('video_name') or item.get('name', f'Video_{i}')
-
-                # Auto-detect content type based on available fields
-                if item.get('mpd_url') and item.get('keys'):
-                    # DRM content detected
-                    mpd_url = item.get('mpd_url')
-                    keys = item.get('keys', [])
-                    key = keys[0] if isinstance(keys, list) else keys
-
-                    task = {
-                        'type': 'drm',
-                        'mpd_url': mpd_url,
-                        'key': key,
-                        'name': name,
-                        'sender': sender
-                    }
-                    tasks_to_add.append(task)
-                    logging.info(f"Added DRM task from JSON: {name}")
-
-                elif item.get('url'):
-                    # Direct content detected
-                    url = item.get('url')
-                    task = {
-                        'type': 'direct',
-                        'url': url,
-                        'name': name,
-                        'sender': sender
-                    }
-                    tasks_to_add.append(task)
-                    logging.info(f"Added direct task from JSON: {name}")
-
-                else:
-                    # Fallback to explicit type checking
-                    item_type = item.get('type', 'drm').lower()
-                    if item_type == 'drm':
-                        mpd_url = item.get('mpd_url')
-                        keys = item.get('keys', [])
-                        if mpd_url and keys:
-                            key = keys[0] if isinstance(keys, list) else keys
-                            task = {
-                                'type': 'drm',
-                                'mpd_url': mpd_url,
-                                'key': key,
-                                'name': name,
-                                'sender': sender
-                            }
-                            tasks_to_add.append(task)
-                            logging.info(f"Added DRM task (explicit) from JSON: {name}")
-                    elif item_type == 'direct':
-                        url = item.get('url')
-                        if url:
-                            task = {
-                                'type': 'direct',
-                                'url': url,
-                                'name': name,
-                                'sender': sender
-                            }
-                            tasks_to_add.append(task)
-                            logging.info(f"Added direct task (explicit) from JSON: {name}")
-
-                    if not tasks_to_add or len(tasks_to_add) == 0 or tasks_to_add[-1]['name'] != name:
-                        invalid_items.append(f"Item {i}: No valid content detected (need mpd_url+keys or url)")
-
-            except Exception as e:
-                invalid_items.append(f"Item {i}: Error processing - {str(e)}")
-
-        # Report invalid items
-        if invalid_items:
-            error_message = "The following items are invalid and will be skipped:\n" + "\n".join(invalid_items)
-            await send_message_with_flood_control(
-                entity=event.chat_id,
-                message=error_message,
-                event=event
-            )
-
-        # If no valid tasks, stop here
-        if not tasks_to_add:
-            await send_message_with_flood_control(
-                entity=event.chat_id,
-                message="No valid items found in JSON data.",
-                event=event
-            )
-            return
-
-        # Add tasks to queue
-        async with user_lock:
-            for task in tasks_to_add:
-                # Use JSON name as filename
-                filename = task['name']
-                user_queue.append(task)
-                logging.info(f"JSON task added to queue for user {sender.id}: {task['name']}.mp4")
-
-            # Reset abort flag if an instance exists
-            if sender.id in user_bot_instances and user_bot_instances[sender.id]:
-                try:
-                    user_bot_instances[sender.id].abort_event.clear()
-                except Exception:
-                    pass
-
-            # Format the start and end index based on range input
-            # Use JSON name as filename
-            if range_input.lower() == "all":
-                range_message = f"1-{len(json_data)}"
-            else:
-                range_message = range_input
-
-            queue_message = f"📋 Selected Range: {range_message}\n"
-            queue_message += f"Added {len(tasks_to_add)} task(s) from JSON to your queue:\n"
-            first_name = tasks_to_add[0]['name']
-            task_type_emoji = "🔐" if tasks_to_add[0]['type'] == 'drm' else "📥"
-            queue_message += f"Task 1: {task_type_emoji} {first_name}.mp4\n"
-
-            if user_states.get(sender.id, False):
-                queue_message += "\nA task is currently being processed. Your tasks will start soon… ⏳"
-
-            await send_message_with_flood_control(
-                entity=event.chat_id,
-                message=queue_message,
-                event=event
-            )
-
-            # Start queue processor if not running
-            if not user_states.get(sender.id, False) and (not user_active_tasks.get(sender.id) or user_active_tasks[sender.id].done()):
-                logging.info(f"Starting queue processor for user {sender.id} from /processjson handler")
-                bot = MPDLeechBot(sender.id)
-                bot._is_json_batch = True # Mark this instance as processing a JSON batch
-                user_bot_instances[sender.id] = bot
-                user_active_tasks[sender.id] = asyncio.create_task(bot.process_queue(event))
-
-        # Don't clear JSON data after processing - keep it for future range selections
-        logging.info(f"Processed range {start_idx + 1}-{end_idx} from JSON data for user {sender.id}")
-
-    except Exception as e:
-        logging.error(f"ProcessJSON handler error: {str(e)}\n{traceback.format_exc()}")
-        await send_message_with_flood_control(
-            entity=event.chat_id,
-            message=f"❌ Failed to process JSON: {str(e)}",
-            event=event
-        )
-
-@client.on(events.NewMessage(pattern=r'^/addthumbnail'))
-async def addthumbnail_handler(event):
-    sender = await event.get_sender()
-    logging.info(f"Received /addthumbnail command from user {sender.id}")
-
-    if sender.id not in authorized_users:
-        await send_message_with_flood_control(
-            entity=event.chat_id,
-            message="You're not authorized.",
-            event=event
-        )
-        return
-
-    await send_message_with_flood_control(
-        entity=event.chat_id,
-        message="🖼️ Please send a photo to use as your custom thumbnail.\n\nThe photo will be used for all your future video uploads.",
-        event=event
-    )
-
-@client.on(events.NewMessage())
-async def thumbnail_photo_handler(event):
-    """Handle thumbnail photo uploads"""
-    sender = await event.get_sender()
-
-    # Only process photos from authorized users
-    if sender.id not in authorized_users or not event.photo:
-        return
-
-    # Only process if it's actually a photo (not JSON text)
-    if event.text and (event.text.strip().startswith('[') or event.text.strip().startswith('{')):
-        return  # Let JSON handler process this
-
-    success, message = await save_thumbnail_from_message(event, sender.id)
-
-    if success:
-        await send_message_with_flood_control(
-            entity=event.chat_id,
-            message=f"✅ {message}",
-            event=event
-        )
-    else:
-        await send_message_with_flood_control(
-            entity=event.chat_id,
-            message=f"❌ {message}",
-            event=event
-        )
-
-@client.on(events.NewMessage(pattern=r'^/removethumbnail'))
-async def removethumbnail_handler(event):
-    sender = await event.get_sender()
-    logging.info(f"Received /removethumbnail command from user {sender.id}")
-
-    if sender.id not in authorized_users:
-        await send_message_with_flood_control(
-            entity=event.chat_id,
-            message="You're not authorized.",
-            event=event
-        )
-        return
-
-    async with thumbnail_lock:
-        if sender.id in user_thumbnails:
-            # Remove the thumbnail file
-            thumbnail_path = user_thumbnails[sender.id]
-            try:
-                if os.path.exists(thumbnail_path):
-                    os.remove(thumbnail_path)
-                del user_thumbnails[sender.id]
-                await send_message_with_flood_control(
-                    entity=event.chat_id,
-                    message="🗑️ Custom thumbnail removed successfully!",
-                    event=event
-                )
-                logging.info(f"Removed thumbnail for user {sender.id}")
-            except Exception as e:
-                await send_message_with_flood_control(
-                    entity=event.chat_id,
-                    message=f"❌ Error removing thumbnail: {str(e)}",
-                    event=event
-                )
-        else:
-            await send_message_with_flood_control(
-                entity=event.chat_id,
-                message="ℹ️ You don't have a custom thumbnail set.",
-                event=event
-            )
-
-@client.on(events.NewMessage(pattern=r'^/addadmin (\d+)$'))
-async def addadmin_handler(event):
-    sender = await event.get_sender()
-    logging.info(f"Received /addadmin command from user {sender.id}")
-
-    # Only allow existing authorized users to add new admins
-    if sender.id not in authorized_users:
-        await send_message_with_flood_control(
-            entity=event.chat_id,
-            message="You're not authorized to add admins.",
-            event=event
-        )
-        return
-
-    user_id = int(event.pattern_match.group(1))
-
-    async with user_lock:
-        if user_id not in authorized_users:
-            authorized_users.add(user_id)
-            await send_message_with_flood_control(
-                entity=event.chat_id,
-                message=f"✅ Admin {user_id} has been added with full bot access.",
-                event=event
-            )
-            logging.info(f"Admin {user_id} added to authorized users by {sender.id}")
-        else:
-            await send_message_with_flood_control(
-                entity=event.chat_id,
-                message=f"ℹ️ User {user_id} is already an admin.",
-                event=event
-            )
-
-@client.on(events.NewMessage(pattern=r'^/removeadmin (\d+)$'))
-async def removeadmin_handler(event):
-    sender = await event.get_sender()
-    logging.info(f"Received /removeadmin command from user {sender.id}")
-
-    # Only allow existing authorized users to remove admins
-    if sender.id not in authorized_users:
-        await send_message_with_flood_control(
-            entity=event.chat_id,
-            message="You're not authorized to remove admins.",
-            event=event
-        )
-        return
-
-    user_id = int(event.pattern_match.group(1))
-
-    # Prevent removing yourself (safety check)
-    if user_id == sender.id:
-        await send_message_with_flood_control(
-            entity=event.chat_id,
-            message="❌ You cannot remove yourself as admin.",
-            event=event
-        )
-        return
-
-    async with user_lock:
-        if user_id in authorized_users:
-            authorized_users.remove(user_id)
-            await send_message_with_flood_control(
-                entity=event.chat_id,
-                message=f"🗑️ Admin {user_id} has been removed from bot access.",
-                event=event
-            )
-            logging.info(f"Admin {user_id} removed from authorized users by {sender.id}")
-        else:
-            await send_message_with_flood_control(
-                entity=event.chat_id,
-                message=f"ℹ️ User {user_id} is not an admin.",
-                event=event
-            )
-
 async def perform_internet_speed_test():
     """Perform live internet speed test for both download and upload"""
     # Download test URLs
@@ -3468,7 +3192,7 @@ async def speed_handler(event):
                 download_primary = f"{download_kbps:.2f} KB/s"
                 download_secondary = f"({download_speed:.0f} B/s)"
 
-            # Create download speed rating
+            # Determine download speed rating
             if download_mbps >= 50:
                 download_rating = "🚀 Excellent"
                 download_emoji = "🟢"
@@ -3508,7 +3232,7 @@ async def speed_handler(event):
                 upload_primary = f"{upload_kbps:.2f} KB/s"
                 upload_secondary = f"({upload_speed:.0f} B/s)"
 
-            # Create upload speed rating
+            # Determine upload speed rating
             if upload_mbps >= 25:
                 upload_rating = "🚀 Excellent"
                 upload_emoji = "🟢"
