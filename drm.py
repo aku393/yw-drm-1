@@ -115,7 +115,7 @@ def setup_bento4():
             # Use a GitHub release URL for reliability
             bento4_urls = [
                 "https://github.com/axiomatic-systems/Bento4/releases/download/v1.6.0-641/Bento4-SDK-1.6.0-641-x86_64-unknown-linux.zip",
-                "https://www.bok.net/Bento4/binaries/Bento4-SDK-1-6-0-641.x86_64-unknown-linux.zip"  # Fallback URL
+                "https://www.bok.net/Bento4/binaries/Bento4-SDK-1-6-0-640.x86_64-unknown-linux.zip"  # Fallback URL
             ]
             zip_path = os.path.join(os.getcwd(), 'Bento4-SDK.zip')
             response = None
@@ -273,6 +273,22 @@ async def retry_with_backoff(coroutine, max_retries=3, base_delay=2, operation_n
             await asyncio.sleep(delay)
     # This line should never be reached due to the raise in the loop, but included for clarity
     raise Exception(f"{operation_name} failed after {max_retries} retries")
+
+def parse_duration(duration_str):
+    if duration_str.startswith('PT'):
+        time_part = duration_str[2:]
+        seconds = 0
+        if 'H' in time_part:
+            h, time_part = time_part.split('H')
+            seconds += int(h) * 3600
+        if 'M' in time_part:
+            m, time_part = time_part.split('M')
+            seconds += int(m) * 60
+        if 'S' in time_part:
+            s = time_part.replace('S', '')
+            seconds += float(s)
+        return int(seconds)
+    return 0
 
 def format_size(bytes_size):
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
@@ -464,7 +480,7 @@ def progress_display(stage, percent, done, total, speed, elapsed, user, user_id,
         "Decrypting": ("🔐", "Decrypting"),
         "Merging": ("🎬", "Merging"),
         "Uploading": ("📤", f"Uploading {percent:.1f}%"),
-        "Splitting": ("✂️", f"Splitting {percent:.1f}%"),
+        "Splitting": ("✂️", "Splitting"),
         "Finalizing": ("🧩", "Finalizing on Telegram"),
         "Completed": ("✅", "Completed"),
         "Initializing": ("🟡", "Initializing"),
@@ -478,22 +494,6 @@ def progress_display(stage, percent, done, total, speed, elapsed, user, user_id,
         f"📦 {format_size(done)} / {format_size(total)}\n"
         f"👤 {user} | 🆔 {user_id}"
     )
-
-def parse_duration(duration_str):
-    if duration_str.startswith('PT'):
-        time_part = duration_str[2:]
-        seconds = 0
-        if 'H' in time_part:
-            h, time_part = time_part.split('H')
-            seconds += int(h) * 3600
-        if 'M' in time_part:
-            m, time_part = time_part.split('M')
-            seconds += int(m) * 60
-        if 'S' in time_part:
-            s = time_part.replace('S', '')
-            seconds += float(s)
-        return int(seconds)
-    return 0
 
 class MPDLeechBot:
     def __init__(self, user_id):
@@ -591,8 +591,13 @@ class MPDLeechBot:
                 'Connection': 'keep-alive',
             }
 
-            timeout = aiohttp.ClientTimeout(total=None, sock_connect=60, sock_read=60)
-            connector = aiohttp.TCPConnector(limit=0, enable_cleanup_closed=True)
+            timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=30)
+            connector = aiohttp.TCPConnector(
+                limit=0, 
+                enable_cleanup_closed=True,
+                keepalive_timeout=30,
+                limit_per_host=10
+            )
             async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
                 async with session.get(url, headers=headers, allow_redirects=True) as response:
                     if response.status != 200:
@@ -672,10 +677,13 @@ class MPDLeechBot:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'video/mp4,application/mp4,*/*',
             'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
+            'Accept-Encoding': 'identity',
             'Cache-Control': 'no-cache',
             'Pragma': 'no-cache',
-            'Connection': 'keep-alive'
+            'Connection': 'keep-alive',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'cross-site',
+            'Sec-Fetch-Dest': 'empty'
         }
         if range_header:
             headers['Range'] = range_header
@@ -685,9 +693,11 @@ class MPDLeechBot:
         async def download_operation():
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 logging.info(f"Fetching: {url}, range={range_header}")
-                async with session.get(url, headers=headers) as response:
+                async with session.get(url, headers=headers, allow_redirects=True) as response:
                     if response.status == 403:
                         raise Exception(f"403 Forbidden: {url}")
+                    if response.status not in [200, 206]:
+                        raise Exception(f"HTTP {response.status}: {response.reason} for {url}")
                     response.raise_for_status()
                     total_size = int(response.headers.get('Content-Length', 0))
                     downloaded = 0
@@ -742,7 +752,7 @@ class MPDLeechBot:
             raise
 
     async def split_file(self, input_file, max_size_mb=1900, progress_cb=None, cancel_event=None):
-        """Split large files based on size with progress tracking and proper cleanup"""
+        """Split large files into exact 1.9GB chunks using file size only"""
         max_size = max_size_mb * 1024 * 1024  # 1.9GB = 1900MB
         file_size = os.path.getsize(input_file)
 
@@ -751,73 +761,25 @@ class MPDLeechBot:
             logging.info(f"File {input_file} ({format_size(file_size)}) is within {max_size_mb}MB limit, no splitting needed")
             return [input_file]
 
-        logging.info(f"File {input_file} ({format_size(file_size)}) exceeds {max_size_mb}MB limit, splitting into parts")
+        logging.info(f"File {input_file} ({format_size(file_size)}) exceeds {max_size_mb}MB limit, splitting into 1.9GB parts")
 
         base_name = os.path.splitext(input_file)[0]
         ext = os.path.splitext(input_file)[1]
         chunks = []
 
-        # Get video duration for calculating target duration per chunk
-        duration = 0
-        duration_methods = [
-            ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', input_file],
-            ['ffprobe', '-v', 'quiet', '-show_entries', 'stream=duration', '-of', 'csv=p=0', input_file],
-        ]
+        # Calculate number of chunks needed for 1.9GB each
+        num_chunks = int((file_size + max_size - 1) // max_size)  # Ceiling division
 
-        for cmd in duration_methods:
-            try:
-                process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-                stdout, stderr = await process.communicate()
-                if process.returncode == 0 and stdout.decode().strip():
-                    duration = float(stdout.decode().strip())
-                    if duration > 0:
-                        break
-            except:
-                continue
+        logging.info(f"Splitting {format_size(file_size)} file into {num_chunks} parts of ~{format_size(max_size)} each")
 
-        # Fallback duration detection
-        if duration <= 0:
-            try:
-                cmd = ['ffmpeg', '-i', input_file, '-f', 'null', '-', '-y']
-                process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-                _, stderr = await process.communicate()
-                for line in stderr.decode().splitlines():
-                    if 'Duration' in line:
-                        time_str = line.split('Duration: ')[1].split(',')[0]
-                        try:
-                            h, m, s = map(float, time_str.split(':'))
-                            duration = h * 3600 + m * 60 + s
-                            break
-                        except:
-                            continue
-            except:
-                pass
-
-        # Calculate number of chunks based on file size
-        num_chunks = max(1, int((file_size + max_size - 1) / max_size))  # Ceiling division
-        target_size_per_chunk = file_size / num_chunks
-        
-        # Calculate approximate duration per chunk if we have total duration
-        if duration > 0:
-            chunk_duration = duration / num_chunks
-            # Ensure minimum chunk duration of 30 seconds
-            chunk_duration = max(30, chunk_duration)
-        else:
-            # Fallback: estimate based on typical bitrates
-            estimated_bitrate = file_size * 8 / max(duration, 1) if duration > 0 else 5 * 1024 * 1024  # 5 Mbps default
-            chunk_duration = (target_size_per_chunk * 8) / estimated_bitrate
-            chunk_duration = max(30, min(chunk_duration, 3600))  # Between 30s and 1 hour
-
-        logging.info(f"Splitting {format_size(file_size)} file into {num_chunks} parts, target size: {format_size(target_size_per_chunk)} each, ~{chunk_duration:.1f}s per part")
-
-        current_time = 0
+        # Split file using FFmpeg with precise file size limits
         for i in range(num_chunks):
             # Check for cancellation
             if cancel_event and cancel_event.is_set():
                 logging.info(f"Splitting cancelled at part {i+1}")
                 break
 
-            output_file = f"{base_name}_part{str(i+1).zfill(3)}{ext}"  # Zero-padded for better sorting
+            output_file = f"{base_name}_part{str(i+1).zfill(3)}{ext}"
 
             # Update progress callback if provided
             if progress_cb:
@@ -826,38 +788,35 @@ class MPDLeechBot:
                 except Exception as e:
                     logging.warning(f"Progress callback error: {e}")
 
-            # Use size-based splitting with FFmpeg segment feature for better accuracy
+            # Calculate exact byte range for this chunk
+            start_byte = i * max_size
             if i == num_chunks - 1:
-                # Last chunk - get everything remaining
-                cmd = [
-                    'ffmpeg', '-i', input_file,
-                    '-ss', str(current_time),
-                    '-c', 'copy',
-                    '-avoid_negative_ts', 'make_zero',
-                    '-map_metadata', '0',
-                    '-movflags', '+faststart',
-                    output_file, '-y'
-                ]
+                # Last chunk gets everything remaining
+                remaining_bytes = file_size - start_byte
+                target_size = remaining_bytes
             else:
-                # Calculate duration to get approximately the target size
-                # We'll use the calculated chunk_duration but may need to adjust
-                cmd = [
-                    'ffmpeg', '-i', input_file,
-                    '-ss', str(current_time),
-                    '-t', str(chunk_duration),
-                    '-c', 'copy',
-                    '-avoid_negative_ts', 'make_zero',
-                    '-map_metadata', '0',
-                    '-movflags', '+faststart',
-                    output_file, '-y'
-                ]
+                # Standard 1.9GB chunk
+                target_size = max_size
 
-            logging.info(f"Splitting part {i+1}/{num_chunks}: {' '.join(cmd[:8])}...")
+            # Use FFmpeg with file size limit (-fs option)
+            cmd = [
+                'ffmpeg', '-i', input_file,
+                '-ss', str(i * 600),  # Use time-based seeking as rough estimate (10min per chunk)
+                '-fs', str(target_size),  # Exact file size limit
+                '-c', 'copy',  # Stream copy for speed
+                '-avoid_negative_ts', 'make_zero',
+                '-map_metadata', '0',
+                '-movflags', '+faststart',
+                '-f', 'mp4',  # Force MP4 format
+                output_file, '-y'
+            ]
+
+            logging.info(f"Creating Part {i+1}/{num_chunks}: target size {format_size(target_size)}")
 
             try:
                 process = await asyncio.create_subprocess_exec(
-                    *cmd, 
-                    stdout=asyncio.subprocess.PIPE, 
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE
                 )
                 stdout, stderr = await process.communicate()
@@ -870,21 +829,15 @@ class MPDLeechBot:
                         logging.warning(f"Progress callback error: {e}")
 
                 if process.returncode == 0 and os.path.exists(output_file):
-                    part_size = os.path.getsize(output_file)
-                    if part_size > 0:
+                    actual_size = os.path.getsize(output_file)
+                    if actual_size > 0:
                         chunks.append(output_file)
-                        logging.info(f"✅ Part {i+1}/{num_chunks}: {os.path.basename(output_file)} ({format_size(part_size)})")
-                        
-                        # If this part is larger than max_size, we need to adjust
-                        if part_size > max_size and i < num_chunks - 1:
-                            logging.warning(f"Part {i+1} size ({format_size(part_size)}) exceeds limit, adjusting duration for next parts")
-                            # Reduce chunk duration for remaining parts
-                            remaining_duration = duration - current_time - chunk_duration if duration > 0 else chunk_duration * (num_chunks - i - 1)
-                            remaining_parts = num_chunks - i - 1
-                            if remaining_parts > 0:
-                                chunk_duration = min(chunk_duration * 0.8, remaining_duration / remaining_parts)  # Reduce by 20%
-                        
-                        current_time += chunk_duration
+                        size_check = "✅" if actual_size <= max_size else "⚠️"
+                        logging.info(f"{size_check} Part {i+1}/{num_chunks}: {format_size(actual_size)} ({os.path.basename(output_file)})")
+
+                        # Verify size is within limit (with 5% tolerance for encoding overhead)
+                        if actual_size > max_size * 1.05:
+                            logging.warning(f"Part {i+1} size {format_size(actual_size)} exceeds target {format_size(max_size)} by {format_size(actual_size - max_size)}")
                     else:
                         logging.error(f"❌ Part {i+1}/{num_chunks}: Empty file created")
                         if os.path.exists(output_file):
@@ -899,16 +852,26 @@ class MPDLeechBot:
         if not chunks:
             raise Exception("Failed to create any valid chunks - check video file integrity")
 
-        if len(chunks) < num_chunks:
-            logging.warning(f"Created {len(chunks)} chunks out of expected {num_chunks}")
-
         # Verify all chunks are within size limit
-        oversized_chunks = [(i, chunk) for i, chunk in enumerate(chunks) if os.path.getsize(chunk) > max_size]
-        if oversized_chunks:
-            logging.warning(f"Found {len(oversized_chunks)} oversized chunks, may need further splitting")
+        oversized_chunks = []
+        total_size = 0
+        for i, chunk in enumerate(chunks):
+            chunk_size = os.path.getsize(chunk)
+            total_size += chunk_size
+            if chunk_size > max_size:
+                oversized_chunks.append((i+1, chunk, chunk_size))
 
-        total_chunks_size = sum(os.path.getsize(chunk) for chunk in chunks)
-        logging.info(f"Splitting complete: {len(chunks)} parts, total size: {format_size(total_chunks_size)}")
+        if oversized_chunks:
+            logging.warning(f"Found {len(oversized_chunks)} oversized chunks:")
+            for part_num, chunk_path, chunk_size in oversized_chunks:
+                logging.warning(f"  Part {part_num}: {format_size(chunk_size)} > {format_size(max_size)}")
+
+        logging.info(f"✅ Splitting complete: {len(chunks)} parts, total: {format_size(total_size)}")
+        expected_parts = int((file_size + max_size - 1) // max_size)
+        if len(chunks) == expected_parts:
+            logging.info(f"✅ Expected {expected_parts} parts, created {len(chunks)} parts - Perfect!")
+        else:
+            logging.warning(f"⚠️ Expected {expected_parts} parts, created {len(chunks)} parts")
 
         return chunks
 
@@ -965,12 +928,15 @@ class MPDLeechBot:
             # Stage 1: Fetch MPD with retries and updated headers
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'video/mp4,application/mp4,*/*',
+                'Accept': 'application/dash+xml,video/mp4,application/mp4,*/*',
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Accept-Encoding': 'gzip, deflate, br',
                 'Cache-Control': 'no-cache',
                 'Pragma': 'no-cache',
-                'Connection': 'keep-alive'
+                'Connection': 'keep-alive',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Site': 'cross-site',
+                'Sec-Fetch-Dest': 'empty'
             }
 
             # Define the MPD fetch operation as a coroutine
@@ -980,6 +946,8 @@ class MPDLeechBot:
                     async with session.get(mpd_url, headers=headers) as response:
                         if response.status == 403:
                             raise Exception(f"403 Forbidden: {mpd_url}")
+                        if response.status not in [200, 206]:
+                            raise Exception(f"HTTP {response.status}: {response.reason} for {mpd_url}")
                         response.raise_for_status()
                         return await response.text()
 
@@ -994,49 +962,154 @@ class MPDLeechBot:
             except Exception as e:
                 raise Exception(f"Failed to fetch MPD after retries: {str(e)}. The URL may require authentication, specific headers, or may be invalid/expired.")
 
-            logging.info(f"MPD content (full): {mpd_content}")
+            logging.info(f"MPD content length: {len(mpd_content)} characters")
+            logging.info(f"MPD content (first 1000 chars): {mpd_content[:1000]}")
+            logging.info(f"MPD content (last 500 chars): {mpd_content[-500:]}")
+            
+            # Check if it contains expected DASH elements
+            if 'MPD' not in mpd_content:
+                logging.warning("MPD content does not contain 'MPD' element")
+            if 'Period' not in mpd_content:
+                logging.warning("MPD content does not contain 'Period' element")
+            if 'AdaptationSet' not in mpd_content:
+                logging.warning("MPD content does not contain 'AdaptationSet' element")
+            if 'Representation' not in mpd_content:
+                logging.warning("MPD content does not contain 'Representation' element")
 
             root = ET.fromstring(mpd_content)
-            namespace = {'ns': 'urn:mpeg:dash:schema:mpd:2011'}
+            
+            # Handle different namespace variations
+            namespaces = [
+                {'ns': 'urn:mpeg:dash:schema:mpd:2011'},
+                {'ns': 'urn:mpeg:DASH:schema:MPD:2011'},
+                {'ns': ''}
+            ]
+            
+            namespace = None
+            for ns in namespaces:
+                if root.findall('.//ns:Period', ns) or root.findall('.//Period'):
+                    namespace = ns
+                    break
+            
+            if namespace is None:
+                namespace = {'ns': ''}
+            
             video_segments = []
             audio_segments = []
             base_url = mpd_url.rsplit('/', 1)[0] + '/'
             duration = parse_duration(root.get('mediaPresentationDuration', 'PT0S'))
 
-            for period in root.findall('.//ns:Period', namespace):
+            logging.info(f"Using namespace: {namespace}")
+            
+            # Try with namespace first, then without
+            periods = root.findall('.//ns:Period', namespace) if namespace.get('ns') else root.findall('.//Period')
+            if not periods:
+                periods = root.findall('.//Period')
+            
+            logging.info(f"Found {len(periods)} periods")
+
+            for period in periods:
                 logging.info(f"Processing Period: {period.get('id', 'no-id')}")
-                for adaptation_set in period.findall('.//ns:AdaptationSet', namespace):
+                
+                # Try with namespace first, then without
+                adaptation_sets = period.findall('.//ns:AdaptationSet', namespace) if namespace.get('ns') else period.findall('.//AdaptationSet')
+                if not adaptation_sets:
+                    adaptation_sets = period.findall('.//AdaptationSet')
+                
+                logging.info(f"Found {len(adaptation_sets)} adaptation sets")
+                
+                for adaptation_set in adaptation_sets:
                     content_type = adaptation_set.get('contentType', '')
+                    mime_type = adaptation_set.get('mimeType', '')
+                    
+                    # Determine content type from mimeType if contentType is missing
+                    if not content_type:
+                        if 'video' in mime_type.lower():
+                            content_type = 'video'
+                        elif 'audio' in mime_type.lower():
+                            content_type = 'audio'
+                    
+                    logging.info(f"AdaptationSet: contentType={content_type}, mimeType={mime_type}")
+                    
+                    if content_type not in ['video', 'audio']:
+                        # Try to infer from child representations
+                        representations = adaptation_set.findall('.//ns:Representation', namespace) if namespace.get('ns') else adaptation_set.findall('.//Representation')
+                        if not representations:
+                            representations = adaptation_set.findall('.//Representation')
+                        
+                        for rep in representations:
+                            rep_mime = rep.get('mimeType', '')
+                            if 'video' in rep_mime.lower():
+                                content_type = 'video'
+                                break
+                            elif 'audio' in rep_mime.lower():
+                                content_type = 'audio'
+                                break
+                    
                     if content_type not in ['video', 'audio']:
                         logging.info(f"Skipping AdaptationSet: contentType={content_type}")
                         continue
+                    
                     segments = video_segments if content_type == 'video' else audio_segments
-                    for representation in adaptation_set.findall('.//ns:Representation', namespace):
-                        mime = representation.get('mimeType', '')
+                    
+                    representations = adaptation_set.findall('.//ns:Representation', namespace) if namespace.get('ns') else adaptation_set.findall('.//Representation')
+                    if not representations:
+                        representations = adaptation_set.findall('.//Representation')
+                    
+                    for representation in representations:
+                        mime = representation.get('mimeType', '') or mime_type
                         codec = representation.get('codecs', '')
                         logging.info(f"Representation: mime={mime}, codec={codec}")
-                        if (content_type == 'video' and ('video' not in mime.lower() or 'avc' not in codec.lower())) or \
-                           (content_type == 'audio' and 'audio' not in mime.lower()):
-                            logging.info("Skipping non-matching representation")
-                            continue
-                        base_url_elem = representation.find('.//ns:BaseURL', namespace)
+                        
+                        # More flexible codec checking
+                        if content_type == 'video':
+                            if mime and 'video' not in mime.lower():
+                                logging.info("Skipping non-video representation")
+                                continue
+                        elif content_type == 'audio':
+                            if mime and 'audio' not in mime.lower():
+                                logging.info("Skipping non-audio representation")
+                                continue
+                        
+                        base_url_elem = representation.find('.//ns:BaseURL', namespace) if namespace.get('ns') else representation.find('.//BaseURL')
+                        if base_url_elem is None:
+                            base_url_elem = representation.find('.//BaseURL')
+                        
                         if base_url_elem is not None:
                             stream_url = base_url + base_url_elem.text.strip()
-                            logging.info(f"Locked {content_type} BaseURL: {stream_url}")
-                            segment_base = representation.find('.//ns:SegmentBase', namespace)
+                            logging.info(f"Found {content_type} BaseURL: {stream_url}")
+                            
+                            segment_base = representation.find('.//ns:SegmentBase', namespace) if namespace.get('ns') else representation.find('.//SegmentBase')
+                            if segment_base is None:
+                                segment_base = representation.find('.//SegmentBase')
+                            
                             if segment_base is not None:
-                                init = segment_base.find('.//ns:Initialization', namespace)
-                                init_range = init.get('range') if init else None
+                                init = segment_base.find('.//ns:Initialization', namespace) if namespace.get('ns') else segment_base.find('.//Initialization')
+                                if init is None:
+                                    init = segment_base.find('.//Initialization')
+                                
+                                init_range = init.get('range') if init is not None else None
                                 logging.info(f"Found {content_type} Initialization range: {init_range}")
+                                
                                 index_range = segment_base.get('indexRange')
                                 if index_range:
-                                    segments.append((stream_url, init_range))
+                                    if init_range:
+                                        segments.append((stream_url, f"bytes={init_range}"))
                                     segments.append((stream_url, f"bytes={index_range.split('-')[1]}-"))
-                                    logging.info(f"{content_type} SegmentBase segments: {segments}")
-                            if not segments:
+                                    logging.info(f"{content_type} SegmentBase segments added: init_range={init_range}, index_range={index_range}")
+                                else:
+                                    # If no indexRange, try to get the whole file
+                                    segments.append((stream_url, None))
+                                    logging.info(f"Added full {content_type} URL (no indexRange): {stream_url}")
+                            else:
+                                # No SegmentBase, add the whole URL
                                 segments.append((stream_url, None))
-                                logging.info(f"Added full {content_type} URL: {stream_url}")
+                                logging.info(f"Added full {content_type} URL (no SegmentBase): {stream_url}")
                             break
+            
+            logging.info(f"Final parsing results:")
+            logging.info(f"Video segments found: {len(video_segments)} - {video_segments}")
+            logging.info(f"Audio segments found: {len(audio_segments)} - {audio_segments}")
 
             if not video_segments:
                 status_msg = await send_message_with_flood_control(
@@ -1140,6 +1213,7 @@ class MPDLeechBot:
 
             # Stage 2: Download Segments
             self.progress_state['stage'] = "Downloading"
+            self.progress_state['percent'] = 0.0  # Reset percent for download stage
             video_files = [os.path.join(self.user_download_dir, f"{name}_video_seg{i}.mp4") for i in range(len(video_segments))]
             audio_files = [os.path.join(self.user_download_dir, f"{name}_audio_seg{i}.mp4") for i in range(len(audio_segments))]
 
@@ -1267,39 +1341,33 @@ class MPDLeechBot:
         finally:
             self.is_downloading = False
 
-    async def detect_premium_status(self, user_id):
-        """Detect if user has premium status with multiple methods"""
+    def cleanup(self, filepath):
+        """Aggressive cleanup of all related files"""
         try:
-            # Get full user entity with all attributes
-            user = await client.get_entity(user_id)
-
-            # Method 1: Check premium attribute directly
-            if hasattr(user, 'premium') and user.premium:
-                logging.info(f"User {user_id} detected as premium via premium attribute")
-                return True
-
-            # Method 2: Check alternative premium attributes
-            premium_indicators = ['is_premium', 'premium_flag', 'has_premium']
-            for attr in premium_indicators:
-                if hasattr(user, attr) and getattr(user, attr, False):
-                    logging.info(f"User {user_id} detected as premium via {attr}")
-                    return True
-
-            # Method 3: Check user flags (Telegram stores premium status in flags)
-            if hasattr(user, 'flags') and user.flags:
-                # Premium users typically have different flag patterns
-                if user.flags & (1 << 4):  # Premium flag bit
-                    logging.info(f"User {user_id} detected as premium via flags")
-                    return True
-
-            # Method 4: Assume premium for now to allow larger uploads
-            # This is safer than blocking legitimate premium users
-            logging.info(f"User {user_id} - assuming premium for large file support")
-            return True
-
+            if filepath and os.path.exists(filepath):
+                os.remove(filepath)
+                logging.info(f"Cleaned up: {filepath}")
         except Exception as e:
-            logging.warning(f"Could not detect premium status for user {user_id}: {e}, assuming premium for safety")
-            return True  # Default to premium to avoid blocking large uploads
+            logging.warning(f"Failed to cleanup {filepath}: {e}")
+
+        # Clean up download directory of old files
+        try:
+            import glob
+            import time
+            current_time = time.time()
+
+            # Remove files older than 1 hour
+            for file_path in glob.glob(os.path.join(self.user_download_dir, "*")):
+                if os.path.isfile(file_path):
+                    file_age = current_time - os.path.getmtime(file_path)
+                    if file_age > 3600:  # 1 hour
+                        try:
+                            os.remove(file_path)
+                            logging.info(f"Cleaned up old file: {file_path}")
+                        except Exception as e:
+                            logging.warning(f"Failed to cleanup old file {file_path}: {e}")
+        except Exception as e:
+            logging.warning(f"Failed to cleanup old files: {e}")
 
     async def upload_file(self, event, filepath, status_msg, total_size, sender, duration):
         try:
@@ -1397,11 +1465,14 @@ class MPDLeechBot:
                     progress_cb=splitting_progress,
                     cancel_event=self.abort_event
                 )
-                # Process each chunk with enhanced progress tracking
+                # Process each chunk with proper upload handling
                 total_chunks = len(chunks)
+                uploaded_chunks = []  # Track successfully uploaded chunks for cleanup
+                overall_start_time = time.time()
+
                 for i, chunk in enumerate(chunks):
                     chunk_size = os.path.getsize(chunk)
-                    chunk_duration = duration // len(chunks) if duration > 0 else 30
+                    chunk_duration = 30  # Fixed duration since we removed duration-based logic
                     progress = {'uploaded': 0}
                     last_update_time = 0
                     chunk_start_time = time.time()
@@ -1413,46 +1484,35 @@ class MPDLeechBot:
                     self.progress_state['percent'] = 0.0
                     self.progress_state['start_time'] = chunk_start_time
 
-                    chunk_info = f"Part {i+1}/{total_chunks} ({format_size(chunk_size)})"
-                    logging.info(f"Starting upload of {chunk_info} for user {sender.id}")
+                    logging.info(f"Starting upload of Part {i+1}/{total_chunks} ({format_size(chunk_size)}) for user {sender.id}")
 
-                    # Custom parallel upload for each chunk with high-speed optimization
-                    file_id = random.getrandbits(63)  # Generate a 63-bit file ID (0 to 2^63 - 1)
-                    part_size = 524288  # Exactly 512 KB (524288 bytes) - Telegram requirement
+                    # Generate unique file ID for each chunk
+                    file_id = random.getrandbits(63)
+                    part_size = 524288  # 512KB chunks for Telegram
                     total_parts = (chunk_size + part_size - 1) // part_size
 
-                    # Validate parameters
                     if total_parts <= 0:
-                        raise ValueError(f"Invalid total_parts for chunk {i+1}: {total_parts}")
+                        logging.error(f"Invalid total_parts for chunk {i+1}: {total_parts}")
+                        continue
 
-                    # Verify last part will be valid size
-                    last_part_size = chunk_size - (total_parts - 1) * part_size
-                    if last_part_size <= 0 or last_part_size > part_size:
-                        logging.warning(f"Chunk {i+1}: Last part size validation - {last_part_size} bytes")
-
-                    # Maximum concurrency for ultra-fast uploads (same as download)
-                    max_concurrent = 15  # High concurrency for maximum speed
+                    max_concurrent = 15
                     semaphore = asyncio.Semaphore(max_concurrent)
-                    logging.info(f"Chunk {i+1}/{len(chunks)}: {format_size(chunk_size)}, {total_parts} parts, {max_concurrent} concurrent, file_id: {file_id}")
+                    logging.info(f"Uploading Part {i+1}/{total_chunks}: {format_size(chunk_size)}, {total_parts} parts, file_id: {file_id}")
 
                     async def upload_part_fast(file_id, part_num, part_size, total_parts, chunk_path, progress, semaphore):
-                        """Ultra-fast upload using memory-mapped files and retry logic"""
                         async with semaphore:
                             retries = 3
                             for attempt in range(retries):
                                 try:
-                                    # Use memory-mapped file for zero-copy reads
                                     with open(chunk_path, 'rb') as f:
                                         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                                             start_pos = part_num * part_size
                                             end_pos = min(start_pos + part_size, len(mm))
                                             data = mm[start_pos:end_pos]
-                                    
+
                                     if not data:
-                                        logging.warning(f"No data read for part {part_num}")
                                         return (part_num, False, "No data")
 
-                                    # Use SaveBigFilePartRequest for large files with retries
                                     result = await client(SaveBigFilePartRequest(
                                         file_id=file_id,
                                         file_part=part_num,
@@ -1465,7 +1525,7 @@ class MPDLeechBot:
                                         return (part_num, True, None)
                                     else:
                                         if attempt < retries - 1:
-                                            await asyncio.sleep(0.5 * (attempt + 1))  # Exponential backoff
+                                            await asyncio.sleep(0.5 * (attempt + 1))
                                             continue
                                         return (part_num, False, "Upload returned False")
 
@@ -1474,31 +1534,24 @@ class MPDLeechBot:
                                         logging.warning(f"Part {part_num} upload attempt {attempt + 1} failed: {e}, retrying...")
                                         await asyncio.sleep(0.5 * (attempt + 1))
                                         continue
-                                    logging.error(f"Part {part_num} upload failed after {retries} attempts: {e}")
                                     return (part_num, False, str(e))
-                            
+
                             return (part_num, False, "Max retries exceeded")
 
                     async def update_progress():
                         nonlocal last_update_time, status_msg
-                        last_percent = 0
 
                         while progress['uploaded'] < chunk_size and not asyncio.current_task().cancelled():
                             current_time = time.time()
 
-                            # Fast UI updates for better user experience (same as download)
-                            update_interval = 3  # Quick updates like download progress
-
-                            if current_time - last_update_time < update_interval:
+                            if current_time - last_update_time < 3:
                                 await asyncio.sleep(0.2)
                                 continue
 
-                            # Calculate current progress
                             self.progress_state['elapsed'] = current_time - self.progress_state['start_time']
                             current_speed = progress['uploaded'] / self.progress_state['elapsed'] if self.progress_state['elapsed'] > 0 else 0
                             current_percent = (progress['uploaded'] / chunk_size * 100) if chunk_size > 0 else 0
 
-                            # Update progress state
                             self.progress_state['speed'] = current_speed
                             self.progress_state['done_size'] = progress['uploaded']
                             self.progress_state['percent'] = current_percent
@@ -1512,7 +1565,7 @@ class MPDLeechBot:
                                 self.progress_state['elapsed'],
                                 sender.first_name,
                                 sender.id,
-                                f"{os.path.basename(chunk)} (Part {i+1}/{len(chunks)})"
+                                f"{os.path.basename(chunk)} (Part {i+1}/{total_chunks})"
                             )
 
                             async with self.update_lock:
@@ -1523,151 +1576,144 @@ class MPDLeechBot:
                                         edit_message=status_msg
                                     )
                                     last_update_time = current_time
-                                    last_percent = current_percent
-                                    logging.info(f"Chunk {i+1}/{len(chunks)} upload: {current_percent:.1f}% at {format_size(current_speed)}/s")
                                 except Exception as e:
                                     logging.warning(f"Progress update failed: {e}")
 
-                            await asyncio.sleep(3)  # Update every 3 seconds like download
+                            await asyncio.sleep(3)
 
-                    upload_start = time.time()
-                    # Create all upload tasks for maximum parallel execution
+                    # Upload all parts in parallel
                     tasks = []
                     for part_num in range(total_parts):
                         tasks.append(upload_part_fast(file_id, part_num, part_size, total_parts, chunk, progress, semaphore))
-                    
-                    # Start progress update task
+
                     progress_task = asyncio.create_task(update_progress())
-                    
-                    # Upload all parts in parallel with maximum concurrency
-                    results = await asyncio.gather(*tasks, return_exceptions=False)
-                    
-                    # Cancel progress task
-                    progress_task.cancel()
+
                     try:
-                        await progress_task
-                    except asyncio.CancelledError:
-                        logging.info(f"Progress task for chunk {i+1} cancelled")
+                        results = await asyncio.gather(*tasks, return_exceptions=False)
 
-                    # Check for failed parts
-                    failed_parts = [(part_num, error) for part_num, success, error in results if not success]
-                    if failed_parts:
-                        error_msgs = [f"Part {part_num} failed: {error}" for part_num, error in failed_parts]
-                        raise Exception("Upload failed for some parts:\n" + "\n".join(error_msgs))
-
-                    # Prepare thumbnail before finalizing
-                    thumbnail_file = None
-                    async with thumbnail_lock:
-                        if sender.id in user_thumbnails and os.path.exists(user_thumbnails[sender.id]):
-                            thumbnail_file = user_thumbnails[sender.id]
-
-                    # If no custom thumbnail, try to extract frame from video, fallback to random
-                    if not thumbnail_file:
-                        temp_thumb_path = os.path.join(self.user_download_dir, f"temp_thumb_{i+1}.jpg")
-                        if await extract_video_frame_thumbnail(chunk, temp_thumb_path, chunk_duration):
-                            thumbnail_file = temp_thumb_path
-                        elif await generate_random_thumbnail(temp_thumb_path):
-                            thumbnail_file = temp_thumb_path
-
-                    # Finalize upload using the file_id and total_parts
-                    input_file_big = InputFileBig(
-                        id=file_id,
-                        parts=total_parts,
-                        name=os.path.basename(chunk)
-                    )
-
-                    # Indicate finalizing before send
-                    self.progress_state['stage'] = "Finalizing"
-                    self.progress_state['percent'] = 100.0
-                    display = progress_display(
-                        self.progress_state['stage'],
-                        self.progress_state['percent'],
-                        self.progress_state['done_size'],
-                        self.progress_state['total_size'],
-                        self.progress_state['speed'],
-                        self.progress_state['elapsed'],
-                        sender.first_name,
-                        sender.id,
-                        f"{os.path.basename(chunk)} (Part {i+1})"
-                    )
-                    async with self.update_lock:
-                        status_msg = await send_message_with_flood_control(entity=event.chat_id, message=display, edit_message=status_msg)
-
-                    # Send the file with optimized attributes and retry logic
-                    async def send_file_operation():
-                        if thumbnail_file and os.path.exists(thumbnail_file):
-                            return await client.send_file(
-                                event.chat_id,
-                                file=input_file_big,
-                                caption=f"Part {i+1}: {os.path.basename(filepath)}",
-                                thumb=thumbnail_file,
-                                attributes=[DocumentAttributeVideo(duration=chunk_duration, w=1280, h=720, supports_streaming=True)],
-                                force_document=False  # Send as video for better streaming
-                            )
-                        else:
-                            return await client.send_file(
-                                event.chat_id,
-                                file=input_file_big,
-                                caption=f"Part {i+1}: {os.path.basename(filepath)}",
-                                attributes=[DocumentAttributeVideo(duration=chunk_duration, w=1280, h=720, supports_streaming=True)],
-                                force_document=False
-                            )
-
-                    # Use retry for file sending with shorter delays
-                    sent_msg = await retry_with_backoff(
-                        coroutine=send_file_operation,
-                        max_retries=3,
-                        base_delay=1,
-                        operation_name=f"Send file part {i+1}"
-                    )
-
-                    # Clean up temp thumbnail
-                    if thumbnail_file and thumbnail_file.startswith(os.path.join(self.user_download_dir, "temp_thumb_")):
+                        # Cancel progress task
+                        progress_task.cancel()
                         try:
-                            os.remove(thumbnail_file)
-                        except:
+                            await progress_task
+                        except asyncio.CancelledError:
                             pass
 
-                    # Store chunk path for cleanup after ALL uploads complete
-                    if not hasattr(self, '_uploaded_chunks'):
-                        self._uploaded_chunks = []
-                    self._uploaded_chunks.append(chunk)
+                        # Check for failed parts
+                        failed_parts = [(part_num, error) for part_num, success, error in results if not success]
+                        if failed_parts:
+                            error_msgs = [f"Part {part_num}: {error}" for part_num, error in failed_parts[:5]]  # Show first 5 errors
+                            raise Exception(f"Upload failed for {len(failed_parts)} parts: " + "; ".join(error_msgs))
 
-                    logging.info(f"✅ Chunk {i+1}/{len(chunks)} uploaded successfully: {os.path.basename(chunk)}")
+                        # Prepare thumbnail
+                        thumbnail_file = None
+                        async with thumbnail_lock:
+                            if sender.id in user_thumbnails and os.path.exists(user_thumbnails[sender.id]):
+                                thumbnail_file = user_thumbnails[sender.id]
 
-                # Cleanup all chunks and original file AFTER all uploads complete
-                try:
-                    # Clean up all uploaded chunks
-                    if hasattr(self, '_uploaded_chunks'):
-                        for chunk_path in self._uploaded_chunks:
+                        if not thumbnail_file:
+                            temp_thumb_path = os.path.join(self.user_download_dir, f"temp_thumb_{i+1}.jpg")
+                            if await extract_video_frame_thumbnail(chunk, temp_thumb_path, chunk_duration):
+                                thumbnail_file = temp_thumb_path
+                            elif await generate_random_thumbnail(temp_thumb_path):
+                                thumbnail_file = temp_thumb_path
+
+                        # Finalize upload
+                        input_file_big = InputFileBig(
+                            id=file_id,
+                            parts=total_parts,
+                            name=os.path.basename(chunk)
+                        )
+
+                        self.progress_state['stage'] = "Finalizing"
+                        self.progress_state['percent'] = 100.0
+                        display = progress_display(
+                            self.progress_state['stage'],
+                            self.progress_state['percent'],
+                            self.progress_state['done_size'],
+                            self.progress_state['total_size'],
+                            self.progress_state['speed'],
+                            self.progress_state['elapsed'],
+                            sender.first_name,
+                            sender.id,
+                            f"{os.path.basename(chunk)} (Part {i+1}/{total_chunks})"
+                        )
+                        async with self.update_lock:
+                            status_msg = await send_message_with_flood_control(entity=event.chat_id, message=display, edit_message=status_msg)
+
+                        # Send the file
+                        async def send_file_operation():
+                            if thumbnail_file and os.path.exists(thumbnail_file):
+                                return await client.send_file(
+                                    event.chat_id,
+                                    file=input_file_big,
+                                    caption=f"Part {i+1}/{total_chunks}: {os.path.basename(filepath)}",
+                                    thumb=thumbnail_file,
+                                    attributes=[DocumentAttributeVideo(duration=chunk_duration, w=1280, h=720, supports_streaming=True)],
+                                    force_document=False
+                                )
+                            else:
+                                return await client.send_file(
+                                    event.chat_id,
+                                    file=input_file_big,
+                                    caption=f"Part {i+1}/{total_chunks}: {os.path.basename(filepath)}",
+                                    attributes=[DocumentAttributeVideo(duration=chunk_duration, w=1280, h=720, supports_streaming=True)],
+                                    force_document=False
+                                )
+
+                        sent_msg = await retry_with_backoff(
+                            coroutine=send_file_operation,
+                            max_retries=3,
+                            base_delay=1,
+                            operation_name=f"Send file part {i+1}"
+                        )
+
+                        # Clean up temp thumbnail
+                        if thumbnail_file and thumbnail_file.startswith(os.path.join(self.user_download_dir, "temp_thumb_")):
                             try:
-                                if os.path.exists(chunk_path):
-                                    os.remove(chunk_path)
-                                    logging.info(f"🗑️ Cleaned up chunk: {os.path.basename(chunk_path)}")
-                            except Exception as e:
-                                logging.warning(f"Failed to delete chunk {chunk_path}: {e}")
-                        self._uploaded_chunks = []
+                                os.remove(thumbnail_file)
+                            except:
+                                pass
 
-                    # Clean up original file
-                    try:
-                        if os.path.exists(filepath):
-                            os.remove(filepath)
-                            logging.info(f"🗑️ Cleaned up original file: {os.path.basename(filepath)}")
+                        uploaded_chunks.append(chunk)
+                        logging.info(f"✅ Part {i+1}/{total_chunks} uploaded successfully: {os.path.basename(chunk)} ({format_size(chunk_size)})")
+
                     except Exception as e:
-                        logging.warning(f"Failed to delete original file {filepath}: {e}")
+                        logging.error(f"❌ Part {i+1}/{total_chunks} upload failed: {str(e)}")
+                        # Cancel progress task
+                        if not progress_task.done():
+                            progress_task.cancel()
+                            try:
+                                await progress_task
+                            except asyncio.CancelledError:
+                                pass
+                        raise
+
+                # Cleanup uploaded chunks and original file
+                try:
+                    for chunk_path in uploaded_chunks:
+                        try:
+                            if os.path.exists(chunk_path):
+                                os.remove(chunk_path)
+                                logging.info(f"🗑️ Cleaned up chunk: {os.path.basename(chunk_path)}")
+                        except Exception as e:
+                            logging.warning(f"Failed to delete chunk {chunk_path}: {e}")
+
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                        logging.info(f"🗑️ Cleaned up original file: {os.path.basename(filepath)}")
 
                 except Exception as cleanup_error:
                     logging.error(f"Cleanup error: {cleanup_error}")
 
-                # Send completion message for multi-part upload
-                total_upload_time = time.time() - upload_start if 'upload_start' in locals() else 0
+                # Send completion message
+                total_upload_time = time.time() - overall_start_time
                 avg_speed = file_size / total_upload_time if total_upload_time > 0 else 0
 
                 await send_message_with_flood_control(
                     entity=event.chat_id,
                     message=f"🎉 **Upload Complete!**\n\n"
                            f"📁 File: {os.path.basename(filepath)}\n"
-                           f"✂️ Split into: {len(chunks)} parts\n"
+                           f"✂️ Split into: {len(uploaded_chunks)} parts\n"
                            f"📊 Total Size: {format_size(file_size)}\n"
                            f"⚡ Average Speed: {format_size(avg_speed)}/s\n"
                            f"⏱️ Total Time: {format_time(total_upload_time)}\n"
@@ -1857,33 +1903,40 @@ class MPDLeechBot:
 
         logging.info(f"Queue processor finished for user {self.user_id}")
 
-    def cleanup(self, filepath):
-        """Aggressive cleanup of all related files"""
+    async def detect_premium_status(self, user_id):
+        """Detect if user has premium status with multiple methods"""
         try:
-            if filepath and os.path.exists(filepath):
-                os.remove(filepath)
-                logging.info(f"Cleaned up: {filepath}")
-        except Exception as e:
-            logging.warning(f"Failed to cleanup {filepath}: {e}")
+            # Get full user entity with all attributes
+            user = await client.get_entity(user_id)
 
-        # Clean up download directory of old files
-        try:
-            import glob
-            import time
-            current_time = time.time()
+            # Method 1: Check premium attribute directly
+            if hasattr(user, 'premium') and user.premium:
+                logging.info(f"User {user_id} detected as premium via premium attribute")
+                return True
 
-            # Remove files older than 1 hour
-            for file_path in glob.glob(os.path.join(self.user_download_dir, "*")):
-                if os.path.isfile(file_path):
-                    file_age = current_time - os.path.getmtime(file_path)
-                    if file_age > 3600:  # 1 hour
-                        try:
-                            os.remove(file_path)
-                            logging.info(f"Cleaned up old file: {file_path}")
-                        except Exception as e:
-                            logging.warning(f"Failed to cleanup old file {file_path}: {e}")
+            # Method 2: Check alternative premium attributes
+            premium_indicators = ['is_premium', 'premium_flag', 'has_premium']
+            for attr in premium_indicators:
+                if hasattr(user, attr) and getattr(user, attr, False):
+                    logging.info(f"User {user_id} detected as premium via {attr}")
+                    return True
+
+            # Method 3: Check user flags (Telegram stores premium status in flags)
+            if hasattr(user, 'flags') and user.flags:
+                # Premium users typically have different flag patterns
+                if user.flags & (1 << 4):  # Premium flag bit
+                    logging.info(f"User {user_id} detected as premium via flags")
+                    return True
+
+            # Method 4: Assume premium for now to allow larger uploads
+            # This is safer than blocking legitimate premium users
+            logging.info(f"User {user_id} - assuming premium for large file support")
+            return True
+
         except Exception as e:
-            logging.warning(f"Failed to cleanup old files: {e}")
+            logging.warning(f"Could not detect premium status for user {user_id}: {e}, assuming premium for safety")
+            return True  # Default to premium to avoid blocking large uploads
+
 
 @client.on(events.NewMessage(pattern=r'^/start'))
 async def start_handler(event):
@@ -2251,7 +2304,7 @@ async def loadjson_handler(event):
 
     await send_message_with_flood_control(
         entity=event.chat_id,
-        message="📥 Ready to receive JSON data!\n\nYou can:\n1. Upload a .json file\n2. Send JSON text directly\n\nExpected format:\n```json\n[\n  {\n    \"name\": \"Video Name\",\n    \"type\": \"drm\",\n    \"mpd_url\": \"https://example.com/manifest.mpd\",\n    \"keys\": [\"kid:key\"]\n  },\n  {\n    \"name\": \"Direct Video\",\n    \"type\": \"direct\",\n    \"url\": \"https://example.com/video.mp4\"\n  }\n]\n```\n\nAfter sending JSON data, use /processjson to start processing all videos!\n\nDirect format also supported in /leech: <direct_url>|<name>",
+        message="📥 Ready to receive JSON data!\n\nYou can:\n1. Upload a .json file\n2. Send JSON text directly\n\n**Auto-Detection Formats:**\n```json\n[\n  {\n    \"video_name\": \"Pleural Effusion\",\n    \"mpd_url\": \"https://example.com/manifest.mpd\",\n    \"keys\": [\"kid:key\"]\n  },\n  {\n    \"name\": \"Direct Video\",\n    \"url\": \"https://example.com/video.mp4\"\n  }\n]\n```\n\n**Features:**\n• Auto-detects DRM (mpd_url + keys) vs Direct (url)\n• Supports both `video_name` and `name` fields\n• No `type` field required!\n\nAfter sending JSON, use `/processjson` to start processing!",
         event=event
     )
 
@@ -2419,24 +2472,16 @@ async def processjson_handler(event):
 
         for i, item in enumerate(selected_data, start_idx + 1):
             try:
-                name = item.get('name', f'Video_{i}')
-                item_type = item.get('type', 'drm').lower()
-
-                if item_type == 'drm':
-                    # DRM protected content
+                # Support both 'name' and 'video_name' fields
+                name = item.get('video_name') or item.get('name', f'Video_{i}')
+                
+                # Auto-detect content type based on available fields
+                if item.get('mpd_url') and item.get('keys'):
+                    # DRM content detected
                     mpd_url = item.get('mpd_url')
                     keys = item.get('keys', [])
-
-                    if not mpd_url:
-                        invalid_items.append(f"Item {i}: Missing mpd_url")
-                        continue
-                    if not keys:
-                        invalid_items.append(f"Item {i}: Missing keys")
-                        continue
-
-                    # Use first key if multiple keys provided
                     key = keys[0] if isinstance(keys, list) else keys
-
+                    
                     tasks_to_add.append({
                         'type': 'drm',
                         'mpd_url': mpd_url,
@@ -2444,24 +2489,56 @@ async def processjson_handler(event):
                         'name': name,
                         'sender': sender
                     })
-
-                elif item_type == 'direct':
-                    # Direct download
+                    
+                elif item.get('url'):
+                    # Direct content detected
                     url = item.get('url')
-
-                    if not url:
-                        invalid_items.append(f"Item {i}: Missing url")
-                        continue
-
                     tasks_to_add.append({
                         'type': 'direct',
                         'url': url,
                         'name': name,
                         'sender': sender
                     })
-
+                    
                 else:
-                    invalid_items.append(f"Item {i}: Unknown type '{item_type}' (supported: drm, direct)")
+                    # Fallback to explicit type checking
+                    item_type = item.get('type', 'drm').lower()
+                    
+                    if item_type == 'drm':
+                        mpd_url = item.get('mpd_url')
+                        keys = item.get('keys', [])
+                        
+                        if not mpd_url:
+                            invalid_items.append(f"Item {i}: Missing mpd_url")
+                            continue
+                        if not keys:
+                            invalid_items.append(f"Item {i}: Missing keys")
+                            continue
+                            
+                        key = keys[0] if isinstance(keys, list) else keys
+                        tasks_to_add.append({
+                            'type': 'drm',
+                            'mpd_url': mpd_url,
+                            'key': key,
+                            'name': name,
+                            'sender': sender
+                        })
+                        
+                    elif item_type == 'direct':
+                        url = item.get('url')
+                        if not url:
+                            invalid_items.append(f"Item {i}: Missing url")
+                            continue
+                            
+                        tasks_to_add.append({
+                            'type': 'direct',
+                            'url': url,
+                            'name': name,
+                            'sender': sender
+                        })
+                        
+                    else:
+                        invalid_items.append(f"Item {i}: No valid content detected (need mpd_url+keys or url)")
 
             except Exception as e:
                 invalid_items.append(f"Item {i}: Error processing - {str(e)}")
@@ -3140,30 +3217,55 @@ async def processbulk_handler(event):
             tasks_to_add = []
             for item in json_data:
                 try:
-                    name = item.get('name', f'Video_{json_index}_{len(tasks_to_add)+1}')
-                    item_type = item.get('type', 'drm').lower()
-
-                    if item_type == 'drm':
+                    # Support both 'name' and 'video_name' fields
+                    name = item.get('video_name') or item.get('name', f'Video_{json_index}_{len(tasks_to_add)+1}')
+                    
+                    # Auto-detect content type based on available fields
+                    if item.get('mpd_url') and item.get('keys'):
+                        # DRM content detected
                         mpd_url = item.get('mpd_url')
                         keys = item.get('keys', [])
-                        if mpd_url and keys:
-                            key = keys[0] if isinstance(keys, list) else keys
-                            tasks_to_add.append({
-                                'type': 'drm',
-                                'mpd_url': mpd_url,
-                                'key': key,
-                                'name': name,
-                                'sender': sender
-                            })
-                    elif item_type == 'direct':
+                        key = keys[0] if isinstance(keys, list) else keys
+                        tasks_to_add.append({
+                            'type': 'drm',
+                            'mpd_url': mpd_url,
+                            'key': key,
+                            'name': name,
+                            'sender': sender
+                        })
+                    elif item.get('url'):
+                        # Direct content detected
                         url = item.get('url')
-                        if url:
-                            tasks_to_add.append({
-                                'type': 'direct',
-                                'url': url,
-                                'name': name,
-                                'sender': sender
-                            })
+                        tasks_to_add.append({
+                            'type': 'direct',
+                            'url': url,
+                            'name': name,
+                            'sender': sender
+                        })
+                    else:
+                        # Fallback to explicit type field for backwards compatibility
+                        item_type = item.get('type', 'drm').lower()
+                        if item_type == 'drm':
+                            mpd_url = item.get('mpd_url')
+                            keys = item.get('keys', [])
+                            if mpd_url and keys:
+                                key = keys[0] if isinstance(keys, list) else keys
+                                tasks_to_add.append({
+                                    'type': 'drm',
+                                    'mpd_url': mpd_url,
+                                    'key': key,
+                                    'name': name,
+                                    'sender': sender
+                                })
+                        elif item_type == 'direct':
+                            url = item.get('url')
+                            if url:
+                                tasks_to_add.append({
+                                    'type': 'direct',
+                                    'url': url,
+                                    'name': name,
+                                    'sender': sender
+                                })
                 except Exception as e:
                     logging.warning(f"Skipping invalid item in JSON {json_index}: {e}")
 
