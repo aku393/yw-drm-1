@@ -868,7 +868,7 @@ class MPDLeechBot:
             raise
 
     async def split_file(self, input_file, max_size_mb=1950, progress_cb=None, cancel_event=None):
-        """Split large files into exact size chunks using pure file size splitting"""
+        """Split large files into chunks using FFmpeg segment splitting"""
         max_size = max_size_mb * 1024 * 1024  # Convert MB to bytes
         file_size = os.path.getsize(input_file)
 
@@ -883,147 +883,121 @@ class MPDLeechBot:
         ext = os.path.splitext(input_file)[1]
         chunks = []
 
-        # Calculate number of chunks needed
-        num_chunks = int((file_size + max_size - 1) // max_size)  # Ceiling division
+        # Calculate approximate duration per chunk based on file size
+        # Get total duration of the video first
+        try:
+            duration_cmd = ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', input_file]
+            process = await asyncio.create_subprocess_exec(*duration_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, stderr = await process.communicate()
+            total_duration = float(stdout.decode().strip()) if stdout.decode().strip() else 0
+        except:
+            total_duration = 0
 
-        logging.info(f"Splitting {format_size(file_size)} file into {num_chunks} parts of exactly {format_size(max_size)} each")
+        if total_duration == 0:
+            logging.warning("Could not determine video duration, falling back to simple file splitting")
+            # Fallback to simple file size splitting using FFmpeg segment
+            segment_size = max_size_mb * 1024 * 1024  # Size in bytes
+            
+            ffmpeg_cmd = [
+                'ffmpeg', '-i', input_file,
+                '-c', 'copy',  # Stream copy to maintain quality
+                '-f', 'segment',
+                '-segment_size', str(segment_size),
+                '-segment_format', 'mp4',
+                '-reset_timestamps', '1',
+                f"{base_name}_part%03d{ext}",
+                '-y'
+            ]
+        else:
+            # Calculate segment duration based on target file size
+            avg_bitrate = (file_size * 8) / total_duration  # bits per second
+            target_duration = (max_size * 8) / avg_bitrate  # seconds per segment
+            
+            # Ensure minimum duration of 10 seconds to avoid too many small segments
+            segment_duration = max(target_duration, 10.0)
+            
+            logging.info(f"Splitting {format_time(total_duration)} video into segments of ~{format_time(segment_duration)} each")
+            
+            ffmpeg_cmd = [
+                'ffmpeg', '-i', input_file,
+                '-c', 'copy',  # Stream copy to maintain quality
+                '-f', 'segment',
+                '-segment_time', str(segment_duration),
+                '-segment_format', 'mp4',
+                '-reset_timestamps', '1',
+                '-avoid_negative_ts', 'make_zero',
+                f"{base_name}_part%03d{ext}",
+                '-y'
+            ]
 
-        # Use pure byte-based splitting with FFmpeg
-        for i in range(num_chunks):
-            # Check for cancellation
-            if cancel_event and cancel_event.is_set():
-                logging.info(f"Splitting cancelled at part {i+1}")
-                break
+        logging.info(f"Running FFmpeg segment command: {' '.join(ffmpeg_cmd)}")
 
-            output_file = f"{base_name}_part{str(i+1).zfill(3)}{ext}"
-
+        try:
             # Update progress callback if provided
             if progress_cb:
                 try:
-                    await progress_cb(i, num_chunks, 0.0)
+                    await progress_cb(0, 1, 0.0)
                 except Exception as e:
                     logging.warning(f"Progress callback error: {e}")
 
-            # Calculate exact byte positions
-            start_byte = i * max_size
-            if i == num_chunks - 1:
-                # Last chunk gets everything remaining
-                end_byte = file_size
+            # Run FFmpeg segmentation
+            process = await asyncio.create_subprocess_exec(
+                *ffmpeg_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+
+            if process.returncode == 0:
+                # Find all generated segments
+                import glob
+                segment_pattern = f"{base_name}_part*{ext}"
+                generated_files = sorted(glob.glob(segment_pattern))
+                
+                if generated_files:
+                    chunks = generated_files
+                    logging.info(f"✅ FFmpeg segmentation successful: {len(chunks)} parts created")
+                    
+                    # Log details of each chunk
+                    total_chunks_size = 0
+                    oversized_chunks = []
+                    for i, chunk in enumerate(chunks, 1):
+                        chunk_size = os.path.getsize(chunk)
+                        total_chunks_size += chunk_size
+                        size_check = "✅" if chunk_size <= max_size * 1.05 else "⚠️"  # 5% tolerance
+                        logging.info(f"{size_check} Part {i}/{len(chunks)}: {format_size(chunk_size)} ({os.path.basename(chunk)})")
+                        
+                        if chunk_size > max_size * 1.05:
+                            oversized_chunks.append((i, chunk, chunk_size))
+                    
+                    if oversized_chunks:
+                        logging.warning(f"Found {len(oversized_chunks)} oversized chunks:")
+                        for part_num, chunk_path, chunk_size in oversized_chunks:
+                            logging.warning(f"  Part {part_num}: {format_size(chunk_size)} > {format_size(max_size)}")
+                    
+                    logging.info(f"✅ Total segments size: {format_size(total_chunks_size)}")
+                else:
+                    error_msg = stderr.decode() if stderr else "No output files generated"
+                    logging.error(f"❌ FFmpeg segmentation failed: {error_msg}")
+                    raise Exception(f"FFmpeg segmentation failed: {error_msg}")
             else:
-                # Standard chunk size
-                end_byte = start_byte + max_size
+                error_msg = stderr.decode() if stderr else "Unknown FFmpeg error"
+                logging.error(f"❌ FFmpeg segmentation failed: {error_msg}")
+                raise Exception(f"FFmpeg segmentation failed: {error_msg}")
 
-            chunk_size = end_byte - start_byte
+            # Update progress callback for completion
+            if progress_cb:
+                try:
+                    await progress_cb(1, 1, 100.0)
+                except Exception as e:
+                    logging.warning(f"Progress callback error: {e}")
 
-            # Use dd command for precise byte-level splitting, then convert to MP4
-            temp_raw_file = f"{base_name}_temp_part{str(i+1).zfill(3)}.raw"
-
-            # Step 1: Extract exact bytes using dd
-            dd_cmd = [
-                'dd',
-                f'if={input_file}',
-                f'of={temp_raw_file}',
-                f'bs=1048576',  # 1MB blocks for efficiency
-                f'skip={start_byte // 1048576}',
-                f'count={chunk_size // 1048576 + 1}',  # Add 1 to ensure we get all bytes
-                'conv=notrunc'
-            ]
-
-            logging.info(f"Creating Part {i+1}/{num_chunks}: extracting bytes {start_byte} to {end_byte} ({format_size(chunk_size)})")
-
-            try:
-                # Extract raw bytes
-                process = await asyncio.create_subprocess_exec(
-                    *dd_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                stdout, stderr = await process.communicate()
-
-                if process.returncode == 0 and os.path.exists(temp_raw_file):
-                    # Truncate to exact size if needed
-                    with open(temp_raw_file, 'r+b') as f:
-                        f.seek(chunk_size)
-                        f.truncate()
-
-                    # Step 2: Convert raw chunk to proper MP4 using FFmpeg
-                    ffmpeg_cmd = [
-                        'ffmpeg', '-i', temp_raw_file,
-                        '-c', 'copy',  # Stream copy to maintain quality
-                        '-avoid_negative_ts', 'make_zero',
-                        '-map_metadata', '0',
-                        '-movflags', '+faststart',
-                        '-f', 'mp4',
-                        output_file, '-y'
-                    ]
-
-                    ffmpeg_process = await asyncio.create_subprocess_exec(
-                        *ffmpeg_cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-                    ffmpeg_stdout, ffmpeg_stderr = await ffmpeg_process.communicate()
-
-                    # Clean up temp file
-                    if os.path.exists(temp_raw_file):
-                        os.remove(temp_raw_file)
-
-                    # Update progress callback for completion of this part
-                    if progress_cb:
-                        try:
-                            await progress_cb(i, num_chunks, 100.0)
-                        except Exception as e:
-                            logging.warning(f"Progress callback error: {e}")
-
-                    if ffmpeg_process.returncode == 0 and os.path.exists(output_file):
-                        actual_size = os.path.getsize(output_file)
-                        if actual_size > 0:
-                            chunks.append(output_file)
-                            size_check = "✅" if actual_size <= max_size * 1.05 else "⚠️"  # 5% tolerance for container overhead
-                            logging.info(f"{size_check} Part {i+1}/{num_chunks}: {format_size(actual_size)} ({os.path.basename(output_file)})")
-
-                            # Log if size exceeds target significantly
-                            if actual_size > max_size * 1.05:
-                                logging.warning(f"Part {i+1} size {format_size(actual_size)} exceeds target {format_size(max_size)} by {format_size(actual_size - max_size)}")
-                        else:
-                            error_msg = ffmpeg_stderr.decode() if ffmpeg_stderr else "Unknown FFmpeg error"
-                            logging.error(f"❌ Part {i+1}/{num_chunks} FFmpeg failed: {error_msg}")
-                    else:
-                        error_msg = ffmpeg_stderr.decode() if ffmpeg_stderr else "Unknown FFmpeg error"
-                        logging.error(f"❌ Part {i+1}/{num_chunks} FFmpeg failed: {error_msg}")
-
-            except Exception as e:
-                logging.error(f"❌ Exception splitting part {i+1}/{num_chunks}: {str(e)}")
-                # Clean up temp file on exception
-                if os.path.exists(temp_raw_file):
-                    try:
-                        os.remove(temp_raw_file)
-                    except:
-                        pass
+        except Exception as e:
+            logging.error(f"❌ Exception during file splitting: {str(e)}")
+            raise Exception(f"File splitting failed: {str(e)}")
 
         if not chunks:
-            raise Exception("Failed to create any valid chunks - check video file integrity and ensure dd/ffmpeg are available")
-
-        # Verify all chunks are within size limit
-        oversized_chunks = []
-        total_size = 0
-        for i, chunk in enumerate(chunks):
-            chunk_size = os.path.getsize(chunk)
-            total_size += chunk_size
-            if chunk_size > max_size * 1.05:  # 5% tolerance for container overhead
-                oversized_chunks.append((i+1, chunk, chunk_size))
-
-        if oversized_chunks:
-            logging.warning(f"Found {len(oversized_chunks)} oversized chunks:")
-            for part_num, chunk_path, chunk_size in oversized_chunks:
-                logging.warning(f"  Part {part_num}: {format_size(chunk_size)} > {format_size(max_size)}")
-
-        logging.info(f"✅ Size-based splitting complete: {len(chunks)} parts, total: {format_size(total_size)}")
-        expected_parts = int((file_size + max_size - 1) // max_size)
-        if len(chunks) == expected_parts:
-            logging.info(f"✅ Expected {expected_parts} parts, created {len(chunks)} parts - Perfect!")
-        else:
-            logging.warning(f"⚠️ Expected {expected_parts} parts, created {len(chunks)} parts")
+            raise Exception("Failed to create any valid chunks - check video file integrity and ensure FFmpeg is available")
 
         return chunks
 
