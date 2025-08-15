@@ -105,6 +105,30 @@ speed_lock = asyncio.Lock()  # Lock for speed tracking
 user_bulk_data = {}  # Format: {user_id: [json_data1, json_data2, ...]}
 bulk_lock = asyncio.Lock()  # Lock for bulk processing
 
+# Thumbnail storage for users
+user_thumbnails = {}  # Format: {user_id: thumbnail_file_path}
+thumbnail_lock = asyncio.Lock()  # Lock for thumbnail management
+
+# Speed tracking for users
+user_speed_stats = {}  # Format: {user_id: {'download_speed': float, 'upload_speed': float, 'last_updated': timestamp}}
+speed_lock = asyncio.Lock()  # Lock for speed tracking
+
+# Bulk JSON processing storage
+user_bulk_data = {}  # Format: {user_id: [json_data1, json_data2, ...]}
+bulk_lock = asyncio.Lock()  # Lock for bulk processing
+
+# Thumbnail storage for users
+user_thumbnails = {}  # Format: {user_id: thumbnail_file_path}
+thumbnail_lock = asyncio.Lock()  # Lock for thumbnail management
+
+# Speed tracking for users
+user_speed_stats = {}  # Format: {user_id: {'download_speed': float, 'upload_speed': float, 'last_updated': timestamp}}
+speed_lock = asyncio.Lock()  # Lock for speed tracking
+
+# Bulk JSON processing storage
+user_bulk_data = {}  # Format: {user_id: [json_data1, json_data2, ...]}
+bulk_lock = asyncio.Lock()  # Lock for bulk processing
+
 # Download and extract Bento4 SDK if not present
 def setup_bento4():
     try:
@@ -1549,9 +1573,9 @@ class MPDLeechBot:
             self.progress_state['speed'] = 0
             self.progress_state['elapsed'] = 0
 
-            # Set size limits to 1950MB cap for all users
-            max_size_mb = 1950  # 1950MB cap for all users
-            max_size_bytes = 1950 * 1024 * 1024  # 1950MB limit
+            # Set size limits to 1900MB cap for all users
+            max_size_mb = 1900  # 1900MB cap for all users
+            max_size_bytes = 1900 * 1024 * 1024  # 1900MB limit
 
             user_type = "PREMIUM" if is_premium else "FREE"
             logging.info(f"User {sender.id} is {user_type}, max file size: {format_size(max_size_bytes)}")
@@ -1565,7 +1589,7 @@ class MPDLeechBot:
                                f"👤 User Type: {user_type}\n"
                                f"📊 File Size: {format_size(file_size)}\n"
                                f"⚖️ Max Size: {format_size(max_size_bytes)}\n"
-                               f"✂️ Splitting into 1950MB parts...",
+                               f"✂️ Splitting into 1900MB parts...",
                         edit_message=status_msg
                     )
                     self.has_notified_split = True
@@ -1677,26 +1701,32 @@ class MPDLeechBot:
                                     if not data:
                                         return (part_num, False, "No data")
 
-                                    result = await client(SaveBigFilePartRequest(
-                                        file_id=file_id,
-                                        file_part=part_num,
-                                        file_total_parts=total_parts,
-                                        bytes=data
-                                    ))
+                                    # Add timeout for individual part uploads
+                                    upload_timeout = 60 if len(data) > 512 * 1024 else 30
+
+                                    result = await asyncio.wait_for(
+                                        client(SaveBigFilePartRequest(
+                                            file_id=file_id,
+                                            file_part=part_num,
+                                            file_total_parts=total_parts,
+                                            bytes=data
+                                        )),
+                                        timeout=upload_timeout
+                                    )
 
                                     if result:
                                         progress['uploaded'] += len(data)
                                         return (part_num, True, None)
                                     else:
                                         if attempt < retries - 1:
-                                            await asyncio.sleep(0.5 * (attempt + 1))
+                                            await asyncio.sleep(1 * (attempt + 1))  # Longer backoff
                                             continue
                                         return (part_num, False, "Upload returned False")
 
                                 except Exception as e:
                                     if attempt < retries - 1:
                                         logging.warning(f"Part {part_num} upload attempt {attempt + 1} failed: {e}, retrying...")
-                                        await asyncio.sleep(0.5 * (attempt + 1))
+                                        await asyncio.sleep(1 * (attempt + 1)) # Longer backoff
                                         continue
                                     return (part_num, False, str(e))
 
@@ -1717,6 +1747,8 @@ class MPDLeechBot:
                             try:
                                 self.progress_state['elapsed'] = current_time - self.progress_state['start_time']
                                 current_speed = progress['uploaded'] / self.progress_state['elapsed'] if self.progress_state['elapsed'] > 0 else 0
+
+                                # Calculate percentage based on uploaded bytes for the current chunk
                                 current_percent = (progress['uploaded'] / chunk_size * 100) if chunk_size > 0 else 0
 
                                 self.progress_state['speed'] = current_speed
@@ -1872,7 +1904,7 @@ class MPDLeechBot:
                         entity=event.chat_id,
                         message=f"🎉 **Upload Complete!**\n\n"
                                f"📁 File: {os.path.basename(filepath)}\n"
-                               f"✂️ Split into: {len(uploaded_chunks)} parts\n"
+                               f"✂️ Split into: {len(uploaded_chunks)} parts (1900MB each)\n"
                                f"📊 Total Size: {format_size(file_size)}\n"
                                f"⚡ Average Speed: {format_size(avg_speed)}/s\n"
                                f"⏱️ Total Time: {format_time(total_upload_time)}\n"
@@ -1934,26 +1966,32 @@ class MPDLeechBot:
                                     if not data:
                                         return (part_num, False, "No data")
 
-                                    result = await client(SaveBigFilePartRequest(
-                                        file_id=file_id,
-                                        file_part=part_num,
-                                        file_total_parts=total_parts,
-                                        bytes=data
-                                    ))
+                                    # Add timeout for individual part uploads
+                                    upload_timeout = 60 if len(data) > 512 * 1024 else 30
+
+                                    result = await asyncio.wait_for(
+                                        client(SaveBigFilePartRequest(
+                                            file_id=file_id,
+                                            file_part=part_num,
+                                            file_total_parts=total_parts,
+                                            bytes=data
+                                        )),
+                                        timeout=upload_timeout
+                                    )
 
                                     if result:
                                         progress['uploaded'] += len(data)
                                         return (part_num, True, None)
                                     else:
                                         if attempt < retries - 1:
-                                            await asyncio.sleep(0.5 * (attempt + 1))
+                                            await asyncio.sleep(1 * (attempt + 1))  # Longer backoff
                                             continue
                                         return (part_num, False, "Upload returned False")
 
                             except Exception as e:
                                 if attempt < retries - 1:
                                     logging.warning(f"Part {part_num} upload attempt {attempt + 1} failed: {e}, retrying...")
-                                    await asyncio.sleep(0.5 * (attempt + 1))
+                                    await asyncio.sleep(1 * (attempt + 1)) # Longer backoff
                                     continue
                                 return (part_num, False, str(e))
 
