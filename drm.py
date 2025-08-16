@@ -46,9 +46,8 @@ load_dotenv()
 API_ID = os.getenv('API_ID')
 API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-SESSION_STRING = os.getenv('SESSION_STRING') or os.getenv('STRING_SESSION')  # Check both names
+SESSION_STRING = os.getenv('SESSION_STRING')
 ALLOWED_USERS = os.getenv('ALLOWED_USERS', '')
-LOG_CHANNEL_ID = -1002552440579  # Log channel ID
 
 if not all([API_ID, API_HASH, BOT_TOKEN, ALLOWED_USERS]):
     logging.error("Missing env vars: Set API_ID, API_HASH, BOT_TOKEN, ALLOWED_USERS in .env")
@@ -235,12 +234,16 @@ except Exception as e:
     print(f"Setup error: {e}")
     raise
 
-# Initialize Telegram clients
-# Admin session client for log channel uploads
-admin_client = None
-
-# Bot client for user interactions
-client = TelegramClient('bot', API_ID, API_HASH, connection_retries=5, auto_reconnect=True)
+# Initialize Telegram client
+if SESSION_STRING and SESSION_STRING.strip():
+    try:
+        session = StringSession(SESSION_STRING.strip())
+        client = TelegramClient(session, API_ID, API_HASH, connection_retries=5, auto_reconnect=True)
+    except Exception as e:
+        print(f"Session error: {e}, using bot token")
+        client = TelegramClient('bot', API_ID, API_HASH, connection_retries=5, auto_reconnect=True)
+else:
+    client = TelegramClient('bot', API_ID, API_HASH, connection_retries=5, auto_reconnect=True)
 
 # Helper function to get user-specific locks and queues
 def get_user_resources(user_id):
@@ -574,7 +577,7 @@ async def save_thumbnail_from_message(event, user_id):
         logging.error(f"Error saving thumbnail: {str(e)}")
         return False, f"Error saving thumbnail: {str(e)}"
 
-def progress_display(stage, percent, done, total, speed, elapsed, user, user_type, filename):
+def progress_display(stage, percent, done, total, speed, elapsed, user, user_id, filename):
     bar_length = 20
     filled = int((percent / 100) * bar_length)
     spinner = ['⣿', '⣷', '⣯', '⣟', '⡿', '⢿', '⣿'][int(time.time() * 10) % 7]
@@ -591,22 +594,13 @@ def progress_display(stage, percent, done, total, speed, elapsed, user, user_typ
         "Initializing": ("🟡", "Initializing"),
     }
     emoji, status_text = stage_info.get(stage, ("🚀", stage))
-    
-    # Format user type with appropriate emoji
-    if user_type == "SESSION":
-        user_type_display = "🔑 Session String"
-    elif user_type == "PREMIUM":
-        user_type_display = "⭐ Premium"
-    else:  # FREE
-        user_type_display = "🆓 Free"
-    
     return (
         f"{spinner} {filename}\n"
         f"{emoji} {status_text}\n"
         f"[{progress_bar}] {percent:.1f}%\n"
         f"⚡ {format_size(speed)}/s | ⏱️ {format_time(elapsed)} | ⌛ {format_time(eta)}\n"
         f"📦 {format_size(done)} / {format_size(total)}\n"
-        f"👤 {user} | {user_type_display}"
+        f"👤 {user} | 🆔 {user_id}"
     )
 
 class MPDLeechBot:
@@ -683,9 +677,6 @@ class MPDLeechBot:
                         self.progress_state['elapsed'] = current_time - self.progress_state['start_time']
                         self.progress_state['speed'] = (self.progress_state['done_size'] / self.progress_state['elapsed']) if self.progress_state['elapsed'] > 0 else 0
 
-                        # Detect user type for progress display
-                        user_type = "SESSION" if (admin_client and SESSION_STRING) else ("PREMIUM" if await self.detect_premium_status(sender.id) else "FREE")
-                        
                         display = progress_display(
                             self.progress_state['stage'],
                             self.progress_state['percent'],
@@ -694,7 +685,7 @@ class MPDLeechBot:
                             self.progress_state['speed'],
                             self.progress_state['elapsed'],
                             sender.first_name,
-                            user_type,
+                            sender.id,
                             name + ".mp4"
                         )
 
@@ -731,11 +722,10 @@ class MPDLeechBot:
 
             timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=30)
             connector = aiohttp.TCPConnector(
-                limit=20,  # Set reasonable limit instead of unlimited
-                limit_per_host=10,
+                limit=0,
                 enable_cleanup_closed=True,
                 keepalive_timeout=30,
-                ttl_dns_cache=300
+                limit_per_host=10
             )
             async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
                 async with session.get(url, headers=headers, allow_redirects=True) as response:
@@ -822,7 +812,7 @@ class MPDLeechBot:
         finally:
             self.is_downloading = False
 
-    async def fetch_segment(self, url, progress, total_segments, range_header=None, output_file=None, session=None):
+    async def fetch_segment(self, url, progress, total_segments, range_header=None, output_file=None):
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'video/mp4,application/mp4,*/*',
@@ -837,30 +827,32 @@ class MPDLeechBot:
         }
         if range_header:
             headers['Range'] = range_header
+        timeout = aiohttp.ClientTimeout(total=300)
 
         # Define the download operation as a coroutine
         async def download_operation():
-            logging.info(f"Fetching: {url}, range={range_header}")
-            async with session.get(url, headers=headers, allow_redirects=True) as response:
-                if response.status == 403:
-                    raise Exception(f"403 Forbidden: {url}")
-                if response.status not in [200, 206]:
-                    raise Exception(f"HTTP {response.status}: {response.reason} for {url}")
-                response.raise_for_status()
-                total_size = int(response.headers.get('Content-Length', 0))
-                downloaded = 0
-                with open(output_file, 'wb') as f:
-                    async for chunk in response.content.iter_chunked(4 * 1024 * 1024):
-                        if self.abort_event.is_set():
-                            raise asyncio.CancelledError()
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        progress['done_size'] += len(chunk)
-                        # Update byte-based progress for MPD
-                        self.progress_state['done_size'] = progress['done_size']
-                logging.info(f"Fetched segment: {url}, size={downloaded} bytes")
-                progress['completed'] += 1
-                return downloaded
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                logging.info(f"Fetching: {url}, range={range_header}")
+                async with session.get(url, headers=headers, allow_redirects=True) as response:
+                    if response.status == 403:
+                        raise Exception(f"403 Forbidden: {url}")
+                    if response.status not in [200, 206]:
+                        raise Exception(f"HTTP {response.status}: {response.reason} for {url}")
+                    response.raise_for_status()
+                    total_size = int(response.headers.get('Content-Length', 0))
+                    downloaded = 0
+                    with open(output_file, 'wb') as f:
+                        async for chunk in response.content.iter_chunked(4 * 1024 * 1024):
+                            if self.abort_event.is_set():
+                                raise asyncio.CancelledError()
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            progress['done_size'] += len(chunk)
+                            # Update byte-based progress for MPD
+                            self.progress_state['done_size'] = progress['done_size']
+                    logging.info(f"Fetched segment: {url}, size={downloaded} bytes")
+                    progress['completed'] += 1
+                    return downloaded
 
         # Use retry_with_backoff for the download operation
         try:
@@ -1127,19 +1119,9 @@ class MPDLeechBot:
                 'Sec-Fetch-Dest': 'empty'
             }
 
-            # Configure connection limits to prevent "too many open files"
-            timeout = aiohttp.ClientTimeout(total=300, sock_connect=30, sock_read=60)
-            connector = aiohttp.TCPConnector(
-                limit=20,  # Total connection pool size
-                limit_per_host=10,  # Max connections per host
-                enable_cleanup_closed=True,
-                keepalive_timeout=30,
-                ttl_dns_cache=300
-            )
-
             # Define the MPD fetch operation as a coroutine
             async def fetch_mpd_operation():
-                async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+                async with aiohttp.ClientSession() as session:
                     logging.info(f"Fetching MPD: {mpd_url}")
                     async with session.get(mpd_url, headers=headers) as response:
                         if response.status == 403:
@@ -1329,9 +1311,6 @@ class MPDLeechBot:
                                     self.progress_state['total_size'] = max_total_size_est
                                     self.progress_state['percent'] = progress['completed'] * 100 / total_segments
 
-                            # Detect user type for progress display
-                            user_type = "SESSION" if (admin_client and SESSION_STRING) else ("PREMIUM" if await self.detect_premium_status(user_id) else "FREE")
-                            
                             display = progress_display(
                                 self.progress_state['stage'],
                                 self.progress_state['percent'],
@@ -1340,7 +1319,7 @@ class MPDLeechBot:
                                 self.progress_state['speed'],
                                 self.progress_state['elapsed'],
                                 user,
-                                user_type,
+                                user_id,
                                 filename
                             )
 
@@ -1410,42 +1389,23 @@ class MPDLeechBot:
             logging.info(f"Starting new update_progress task for {name}")
             self.progress_task = asyncio.create_task(update_progress(name + ".mp4", sender.first_name, sender.id))
 
-            # Stage 2: Download Segments with shared session and concurrency control
+            # Stage 2: Download Segments
             self.progress_state['stage'] = "Downloading"
             self.progress_state['percent'] = 0.0  # Reset percent for download stage
             video_files = [os.path.join(self.user_download_dir, f"{name}_video_seg{i}.mp4") for i in range(len(video_segments))]
             audio_files = [os.path.join(self.user_download_dir, f"{name}_audio_seg{i}.mp4") for i in range(len(audio_segments))]
 
-            # Use shared session and semaphore to control concurrent downloads
-            max_concurrent_downloads = 8  # Reduced from unlimited to prevent file descriptor exhaustion
-            semaphore = asyncio.Semaphore(max_concurrent_downloads)
-            
-            async def download_with_semaphore(seg_url, range_header, output_file, session):
-                async with semaphore:
-                    return await self.fetch_segment(seg_url, progress, total_segments, range_header, output_file, session)
+            tasks = []
 
-            # Create shared session for all downloads
-            timeout = aiohttp.ClientTimeout(total=300, sock_connect=30, sock_read=60)
-            connector = aiohttp.TCPConnector(
-                limit=20,  # Total connection pool size
-                limit_per_host=10,  # Max connections per host
-                enable_cleanup_closed=True,
-                keepalive_timeout=30,
-                ttl_dns_cache=300
-            )
+            for i, (seg_url, range_header) in enumerate(video_segments):
+                tasks.append(self.fetch_segment(seg_url, progress, total_segments, range_header, video_files[i]))
+            for i, (seg_url, range_header) in enumerate(audio_segments):
+                tasks.append(self.fetch_segment(seg_url, progress, total_segments, range_header, audio_files[i]))
 
-            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-                tasks = []
-
-                for i, (seg_url, range_header) in enumerate(video_segments):
-                    tasks.append(download_with_semaphore(seg_url, range_header, video_files[i], session))
-                for i, (seg_url, range_header) in enumerate(audio_segments):
-                    tasks.append(download_with_semaphore(seg_url, range_header, audio_files[i], session))
-
-                segment_sizes = await asyncio.gather(*tasks, return_exceptions=True)
-                for i, result in enumerate(segment_sizes):
-                    if isinstance(result, Exception):
-                        raise result
+            segment_sizes = await asyncio.gather(*tasks, return_exceptions=True)
+            for i, result in enumerate(segment_sizes):
+                if isinstance(result, Exception):
+                    raise result
 
             with open(raw_video_file, 'wb') as outfile:
                 for seg_file in video_files:
@@ -1613,35 +1573,23 @@ class MPDLeechBot:
             self.progress_state['speed'] = 0
             self.progress_state['elapsed'] = 0
 
-            # Set size limits based on session string availability first, then premium status
-            if admin_client and SESSION_STRING:
-                # When session string is available, use higher limits for better upload capability
-                max_size_mb = 3950  # 3.95GB when session string is available
-                max_size_bytes = int(3.95 * 1024 * 1024 * 1024)  # 3.95GB limit
-                user_type = "SESSION"
-                logging.info(f"User {sender.id} using session string upload - max file size: {format_size(max_size_bytes)}")
-            elif is_premium:
-                max_size_mb = 3980  # 3.98GB for premium users
-                max_size_bytes = int(3.98 * 1024 * 1024 * 1024)  # 3.98GB limit
-                user_type = "PREMIUM"
-                logging.info(f"User {sender.id} is premium, max file size: {format_size(max_size_bytes)}")
-            else:
-                max_size_mb = 1950  # 1.95GB for free users
-                max_size_bytes = int(1.95 * 1024 * 1024 * 1024)  # 1.95GB limit
-                user_type = "FREE"
-                logging.info(f"User {sender.id} is free user, max file size: {format_size(max_size_bytes)}")
+            # Set size limits to 1900MB cap for all users
+            max_size_mb = 1900  # 1900MB cap for all users
+            max_size_bytes = 1900 * 1024 * 1024  # 1900MB limit
+
+            user_type = "PREMIUM" if is_premium else "FREE"
+            logging.info(f"User {sender.id} is {user_type}, max file size: {format_size(max_size_bytes)}")
 
             # Check if file needs to be split
             if file_size > max_size_bytes:
                 if not self.has_notified_split:
-                    split_size_display = f"{split_size_mb}MB" if admin_client and SESSION_STRING else "1900MB"
                     await send_message_with_flood_control(
                         entity=event.chat_id,
                         message=f"📁 **File Splitting Required**\n\n"
                                f"👤 User Type: {user_type}\n"
                                f"📊 File Size: {format_size(file_size)}\n"
                                f"⚖️ Max Size: {format_size(max_size_bytes)}\n"
-                               f"✂️ Splitting into {split_size_display} parts...",
+                               f"✂️ Splitting into 1900MB parts...",
                         edit_message=status_msg
                     )
                     self.has_notified_split = True
@@ -1676,9 +1624,6 @@ class MPDLeechBot:
 
                         # Create enhanced progress display
                         eta = (file_size - processed_bytes) / speed if speed > 0 else 0
-                        # Detect user type for progress display
-                        user_type = "SESSION" if (admin_client and SESSION_STRING) else ("PREMIUM" if await self.detect_premium_status(sender.id) else "FREE")
-                        
                         display = progress_display(
                             self.progress_state['stage'],
                             self.progress_state['percent'],
@@ -1687,7 +1632,7 @@ class MPDLeechBot:
                             self.progress_state['speed'],
                             self.progress_state['elapsed'],
                             sender.first_name,
-                            user_type,
+                            sender.id,
                             f"{os.path.basename(filepath)} (Part {min(current_index+1, total_parts)}/{total_parts})"
                         )
 
@@ -1702,11 +1647,10 @@ class MPDLeechBot:
                     except Exception as e:
                         logging.error(f"Error in splitting progress callback: {e}")
 
-                # Split file with proper size limits (use 3950MB when session string is available)
-                split_size_mb = 3950 if (admin_client and SESSION_STRING) else max_size_mb
+                # Split file with proper size limits
                 chunks = await self.split_file(
                     filepath,
-                    max_size_mb=split_size_mb,
+                    max_size_mb=max_size_mb,
                     progress_cb=splitting_progress,
                     cancel_event=self.abort_event
                 )
@@ -1735,68 +1679,33 @@ class MPDLeechBot:
                     part_size = 524288  # 512KB chunks for Telegram
                     total_parts = (chunk_size + part_size - 1) // part_size
 
-                    # Calculate optimal part size for large files
-                    # For 3.8GB+ files, we need larger parts to stay under 4000 part limit
-                    min_part_size = 1024 * 1024  # 1MB minimum
-                    max_part_size = 512 * 1024 * 1024  # 512MB maximum (Telegram limit)
-                    
-                    # Calculate required part size to stay under 4000 parts
-                    required_part_size = (chunk_size + 3999) // 4000
-                    
-                    # Round up to nearest 1MB for efficiency
-                    optimal_part_size = ((required_part_size + 1024 * 1024 - 1) // (1024 * 1024)) * (1024 * 1024)
-                    
-                    # Ensure part size is within limits
-                    part_size = max(min_part_size, min(optimal_part_size, max_part_size))
-                    
-                    # Recalculate total parts with optimal size
-                    total_parts = (chunk_size + part_size - 1) // part_size
-                    
-                    # Final validation
-                    if total_parts > 4000:
-                        # If still too many parts, use maximum allowed part size
-                        part_size = max_part_size
-                        total_parts = (chunk_size + part_size - 1) // part_size
-                        
-                    if total_parts <= 0 or total_parts > 4000:
-                        logging.error(f"CRITICAL: Cannot upload chunk {i+1}: {total_parts} parts (chunk_size: {chunk_size}, part_size: {part_size})")
+                    if total_parts <= 0:
+                        logging.error(f"Invalid total_parts for chunk {i+1}: {total_parts}")
                         continue
 
-                    # Use session string client for large file uploads if available
-                    upload_client = admin_client if admin_client else client
-                    
-                    max_concurrent = 6  # Reduced for large files to avoid rate limits
+                    max_concurrent = 15
                     semaphore = asyncio.Semaphore(max_concurrent)
-                    logging.info(f"Uploading Part {i+1}/{total_chunks}: {format_size(chunk_size)}, {total_parts} parts, file_id: {file_id}, part_size: {format_size(part_size)} via {type(upload_client).__name__}")
+                    logging.info(f"Uploading Part {i+1}/{total_chunks}: {format_size(chunk_size)}, {total_parts} parts, file_id: {file_id}")
 
-                    async def upload_part_fast(file_id, part_num, part_size, total_parts, chunk_path, progress, semaphore, upload_client):
+                    async def upload_part_fast(file_id, part_num, part_size, total_parts, chunk_path, progress, semaphore):
                         async with semaphore:
-                            retries = 5  # Increased retries for large files
+                            retries = 3
                             for attempt in range(retries):
                                 try:
                                     with open(chunk_path, 'rb') as f:
-                                        f.seek(part_num * part_size)
-                                        data = f.read(part_size)
+                                        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                                            start_pos = part_num * part_size
+                                            end_pos = min(start_pos + part_size, len(mm))
+                                            data = mm[start_pos:end_pos]
 
                                     if not data:
                                         return (part_num, False, "No data")
 
-                                    # Strict validation for large files
-                                    if part_num >= total_parts:
-                                        return (part_num, False, f"Part number {part_num} exceeds total parts {total_parts}")
-                                    
-                                    if part_num < 0:
-                                        return (part_num, False, f"Invalid part number {part_num}")
-                                    
-                                    if len(data) > 512 * 1024 * 1024:  # 512MB max
-                                        return (part_num, False, f"Part size {len(data)} exceeds 512MB limit")
+                                    # Add timeout for individual part uploads
+                                    upload_timeout = 60 if len(data) > 512 * 1024 else 30
 
-                                    # Extended timeout for large parts
-                                    upload_timeout = 180 if len(data) > 100 * 1024 * 1024 else 120
-
-                                    # Use the appropriate client (session string preferred for large files)
                                     result = await asyncio.wait_for(
-                                        upload_client(SaveBigFilePartRequest(
+                                        client(SaveBigFilePartRequest(
                                             file_id=file_id,
                                             file_part=part_num,
                                             file_total_parts=total_parts,
@@ -1810,25 +1719,14 @@ class MPDLeechBot:
                                         return (part_num, True, None)
                                     else:
                                         if attempt < retries - 1:
-                                            await asyncio.sleep(3 * (attempt + 1))  # Longer backoff for large files
+                                            await asyncio.sleep(1 * (attempt + 1))  # Longer backoff
                                             continue
                                         return (part_num, False, "Upload returned False")
 
                                 except Exception as e:
-                                    error_msg = str(e)
-                                    if "invalid" in error_msg.lower() and "parts" in error_msg.lower():
-                                        logging.error(f"Parts validation error - file_id: {file_id}, part: {part_num}, total: {total_parts}, data_size: {len(data) if 'data' in locals() else 'unknown'}")
-                                        logging.error(f"Chunk path: {chunk_path}, chunk size: {os.path.getsize(chunk_path) if os.path.exists(chunk_path) else 'N/A'}")
-                                    
-                                    if "flood" in error_msg.lower() or "wait" in error_msg.lower():
-                                        # Handle flood wait with exponential backoff
-                                        wait_time = min(60, 5 * (2 ** attempt))
-                                        logging.warning(f"Flood wait detected, waiting {wait_time}s before retry")
-                                        await asyncio.sleep(wait_time)
-                                    
                                     if attempt < retries - 1:
                                         logging.warning(f"Part {part_num} upload attempt {attempt + 1} failed: {e}, retrying...")
-                                        await asyncio.sleep(3 * (attempt + 1))
+                                        await asyncio.sleep(1 * (attempt + 1)) # Longer backoff
                                         continue
                                     return (part_num, False, str(e))
 
@@ -1857,9 +1755,6 @@ class MPDLeechBot:
                                 self.progress_state['done_size'] = progress['uploaded']
                                 self.progress_state['percent'] = current_percent
 
-                                # Detect user type for progress display
-                                user_type = "SESSION" if (admin_client and SESSION_STRING) else ("PREMIUM" if is_premium else "FREE")
-                                
                                 display = progress_display(
                                     self.progress_state['stage'],
                                     self.progress_state['percent'],
@@ -1868,7 +1763,7 @@ class MPDLeechBot:
                                     self.progress_state['speed'],
                                     self.progress_state['elapsed'],
                                     sender.first_name,
-                                    user_type,
+                                    sender.id,
                                     f"{os.path.basename(chunk)} (Part {i+1}/{total_chunks})"
                                 )
 
@@ -1890,10 +1785,10 @@ class MPDLeechBot:
                             # Wait exactly 6 seconds before next update
                             await asyncio.sleep(UPDATE_INTERVAL)
 
-                    # Upload all parts in parallel using appropriate client
+                    # Upload all parts in parallel
                     tasks = []
                     for part_num in range(total_parts):
-                        tasks.append(upload_part_fast(file_id, part_num, part_size, total_parts, chunk, progress, semaphore, upload_client))
+                        tasks.append(upload_part_fast(file_id, part_num, part_size, total_parts, chunk, progress, semaphore))
 
                     progress_task = asyncio.create_task(update_progress())
 
@@ -1935,9 +1830,6 @@ class MPDLeechBot:
 
                         self.progress_state['stage'] = "Finalizing"
                         self.progress_state['percent'] = 100.0
-                        # Detect user type for progress display
-                        user_type = "SESSION" if (admin_client and SESSION_STRING) else ("PREMIUM" if is_premium else "FREE")
-                        
                         display = progress_display(
                             self.progress_state['stage'],
                             self.progress_state['percent'],
@@ -1946,7 +1838,7 @@ class MPDLeechBot:
                             self.progress_state['speed'],
                             self.progress_state['elapsed'],
                             sender.first_name,
-                            user_type,
+                            sender.id,
                             f"{os.path.basename(chunk)} (Part {i+1}/{total_chunks})"
                         )
                         async with self.update_lock:
@@ -1986,15 +1878,13 @@ class MPDLeechBot:
                         except Exception as e:
                             logging.warning(f"Failed to extract video metadata: {e}")
 
-                        # Upload to log channel using session string client (preferred for 4GB+ files)
-                        async def upload_to_log_channel():
-                            # Use session string client if available, otherwise fall back to bot client
-                            upload_client = admin_client if admin_client else client
+                        # Send the file
+                        async def send_file_operation():
                             if thumbnail_file and os.path.exists(thumbnail_file):
-                                return await upload_client.send_file(
-                                    LOG_CHANNEL_ID,
+                                return await client.send_file(
+                                    event.chat_id,
                                     file=input_file_big,
-                                    caption=f"Part {i+1}/{total_chunks}: {os.path.basename(filepath)} - User: {sender.id}",
+                                    caption=f"Part {i+1}/{total_chunks}: {os.path.basename(filepath)}",
                                     thumb=thumbnail_file,
                                     attributes=[DocumentAttributeVideo(
                                         duration=video_duration, 
@@ -2005,10 +1895,10 @@ class MPDLeechBot:
                                     force_document=False
                                 )
                             else:
-                                return await upload_client.send_file(
-                                    LOG_CHANNEL_ID,
+                                return await client.send_file(
+                                    event.chat_id,
                                     file=input_file_big,
-                                    caption=f"Part {i+1}/{total_chunks}: {os.path.basename(filepath)} - User: {sender.id}",
+                                    caption=f"Part {i+1}/{total_chunks}: {os.path.basename(filepath)}",
                                     attributes=[DocumentAttributeVideo(
                                         duration=video_duration, 
                                         w=video_width, 
@@ -2018,35 +1908,11 @@ class MPDLeechBot:
                                     force_document=False
                                 )
 
-                        # Upload to log channel
-                        log_msg = await retry_with_backoff(
-                            coroutine=upload_to_log_channel,
-                            max_retries=3,
-                            base_delay=1,
-                            operation_name=f"Upload file part {i+1} to log channel"
-                        )
-
-                        # Send file from log channel to user (appears as new message without forwarding label)
-                        async def send_to_user():
-                            return await client.send_file(
-                                entity=event.chat_id,
-                                file=log_msg.media,
-                                caption=f"Part {i+1}/{total_chunks}: {os.path.basename(filepath)}",
-                                thumb=thumbnail_file if thumbnail_file and os.path.exists(thumbnail_file) else None,
-                                attributes=[DocumentAttributeVideo(
-                                    duration=video_duration, 
-                                    w=video_width, 
-                                    h=video_height, 
-                                    supports_streaming=True
-                                )],
-                                force_document=False
-                            )
-
                         sent_msg = await retry_with_backoff(
-                            coroutine=send_to_user,
+                            coroutine=send_file_operation,
                             max_retries=3,
                             base_delay=1,
-                            operation_name=f"Send file part {i+1} to user"
+                            operation_name=f"Send file part {i+1}"
                         )
 
                         # Clean up temp thumbnail
@@ -2078,12 +1944,11 @@ class MPDLeechBot:
                 # Check if this is from JSON processing by looking at the task source
                 is_json_batch = hasattr(self, '_is_json_batch') and self._is_json_batch
                 if not is_json_batch:
-                    split_info = f"{split_size_mb}MB each" if admin_client and SESSION_STRING else "1900MB each"
                     await send_message_with_flood_control(
                         entity=event.chat_id,
                         message=f"🎉 **Upload Complete!**\n\n"
                                f"📁 File: {os.path.basename(filepath)}\n"
-                               f"✂️ Split into: {len(uploaded_chunks)} parts ({split_info})\n"
+                               f"✂️ Split into: {len(uploaded_chunks)} parts (1900MB each)\n"
                                f"📊 Total Size: {format_size(file_size)}\n"
                                f"⚡ Average Speed: {format_size(avg_speed)}/s\n"
                                f"⏱️ Total Time: {format_time(total_upload_time)}\n"
@@ -2123,99 +1988,54 @@ class MPDLeechBot:
                 part_size = 524288  # 512KB chunks
                 total_parts = (file_size + part_size - 1) // part_size
 
-                # Calculate optimal part size for large single files
-                min_part_size = 1024 * 1024  # 1MB minimum
-                max_part_size = 512 * 1024 * 1024  # 512MB maximum
-                
-                # Calculate required part size to stay under 4000 parts
-                required_part_size = (file_size + 3999) // 4000
-                
-                # Round up to nearest 1MB for efficiency
-                optimal_part_size = ((required_part_size + 1024 * 1024 - 1) // (1024 * 1024)) * (1024 * 1024)
-                
-                # Ensure part size is within limits
-                part_size = max(min_part_size, min(optimal_part_size, max_part_size))
-                
-                # Recalculate total parts with optimal size
-                total_parts = (file_size + part_size - 1) // part_size
-                
-                # Final validation
-                if total_parts > 4000:
-                    part_size = max_part_size
-                    total_parts = (file_size + part_size - 1) // part_size
+                if total_parts <= 0:
+                    raise Exception("Invalid file size for upload")
 
-                if total_parts <= 0 or total_parts > 4000:
-                    raise Exception(f"CRITICAL: Cannot upload file: {total_parts} parts (file_size: {file_size}, part_size: {part_size})")
-
-                # Use session string client for large file uploads if available
-                upload_client = admin_client if admin_client else client
-                
-                max_concurrent = 6  # Reduced for large files
+                max_concurrent = 15
                 semaphore = asyncio.Semaphore(max_concurrent)
                 progress = {'uploaded': 0}
                 last_update_time = 0
-                logging.info(f"Single file upload: {format_size(file_size)}, {total_parts} parts, part_size: {format_size(part_size)} via {type(upload_client).__name__}")
 
-                async def upload_part_single(file_id, part_num, part_size, total_parts, file_path, progress, semaphore, upload_client):
+                async def upload_part_single(file_id, part_num, part_size, total_parts, file_path, progress, semaphore):
                     async with semaphore:
-                        retries = 5  # Increased retries for large files
+                        retries = 3
                         for attempt in range(retries):
                             try:
                                 with open(file_path, 'rb') as f:
-                                    f.seek(part_num * part_size)
-                                    data = f.read(part_size)
+                                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                                        start_pos = part_num * part_size
+                                        end_pos = min(start_pos + part_size, len(mm))
+                                        data = mm[start_pos:end_pos]
 
-                                if not data:
-                                    return (part_num, False, "No data")
+                                    if not data:
+                                        return (part_num, False, "No data")
 
-                                # Strict validation for large files
-                                if part_num >= total_parts:
-                                    return (part_num, False, f"Part number {part_num} exceeds total parts {total_parts}")
-                                
-                                if part_num < 0:
-                                    return (part_num, False, f"Invalid part number {part_num}")
-                                
-                                if len(data) > 512 * 1024 * 1024:  # 512MB max
-                                    return (part_num, False, f"Part size {len(data)} exceeds 512MB limit")
+                                    # Add timeout for individual part uploads
+                                    upload_timeout = 60 if len(data) > 512 * 1024 else 30
 
-                                # Extended timeout for large parts
-                                upload_timeout = 180 if len(data) > 100 * 1024 * 1024 else 120
+                                    result = await asyncio.wait_for(
+                                        client(SaveBigFilePartRequest(
+                                            file_id=file_id,
+                                            file_part=part_num,
+                                            file_total_parts=total_parts,
+                                            bytes=data
+                                        )),
+                                        timeout=upload_timeout
+                                    )
 
-                                # Use the appropriate client (session string preferred for large files)
-                                result = await asyncio.wait_for(
-                                    upload_client(SaveBigFilePartRequest(
-                                        file_id=file_id,
-                                        file_part=part_num,
-                                        file_total_parts=total_parts,
-                                        bytes=data
-                                    )),
-                                    timeout=upload_timeout
-                                )
-
-                                if result:
-                                    progress['uploaded'] += len(data)
-                                    return (part_num, True, None)
-                                else:
-                                    if attempt < retries - 1:
-                                        await asyncio.sleep(3 * (attempt + 1))  # Longer backoff for large files
-                                        continue
-                                    return (part_num, False, "Upload returned False")
+                                    if result:
+                                        progress['uploaded'] += len(data)
+                                        return (part_num, True, None)
+                                    else:
+                                        if attempt < retries - 1:
+                                            await asyncio.sleep(1 * (attempt + 1))  # Longer backoff
+                                            continue
+                                        return (part_num, False, "Upload returned False")
 
                             except Exception as e:
-                                error_msg = str(e)
-                                if "invalid" in error_msg.lower() and "parts" in error_msg.lower():
-                                    logging.error(f"Parts validation error - file_id: {file_id}, part: {part_num}, total: {total_parts}, data_size: {len(data) if 'data' in locals() else 'unknown'}")
-                                    logging.error(f"File path: {file_path}, file size: {os.path.getsize(file_path) if os.path.exists(file_path) else 'N/A'}")
-                                
-                                if "flood" in error_msg.lower() or "wait" in error_msg.lower():
-                                    # Handle flood wait with exponential backoff
-                                    wait_time = min(60, 5 * (2 ** attempt))
-                                    logging.warning(f"Flood wait detected, waiting {wait_time}s before retry")
-                                    await asyncio.sleep(wait_time)
-                                
                                 if attempt < retries - 1:
                                     logging.warning(f"Part {part_num} upload attempt {attempt + 1} failed: {e}, retrying...")
-                                    await asyncio.sleep(3 * (attempt + 1))
+                                    await asyncio.sleep(1 * (attempt + 1)) # Longer backoff
                                     continue
                                 return (part_num, False, str(e))
 
@@ -2241,9 +2061,6 @@ class MPDLeechBot:
                             self.progress_state['done_size'] = progress['uploaded']
                             self.progress_state['percent'] = current_percent
 
-                            # Detect user type for progress display
-                            user_type = "SESSION" if (admin_client and SESSION_STRING) else ("PREMIUM" if is_premium else "FREE")
-                            
                             display = progress_display(
                                 self.progress_state['stage'],
                                 self.progress_state['percent'],
@@ -2252,7 +2069,7 @@ class MPDLeechBot:
                                 self.progress_state['speed'],
                                 self.progress_state['elapsed'],
                                 sender.first_name,
-                                user_type,
+                                sender.id,
                                 os.path.basename(filepath)
                             )
 
@@ -2273,10 +2090,10 @@ class MPDLeechBot:
                         # Wait exactly 6 seconds before next update
                         await asyncio.sleep(UPDATE_INTERVAL)
 
-                # Upload all parts in parallel using appropriate client
+                # Upload all parts in parallel
                 tasks = []
                 for part_num in range(total_parts):
-                    tasks.append(upload_part_single(file_id, part_num, part_size, total_parts, filepath, progress, semaphore, upload_client))
+                    tasks.append(upload_part_single(file_id, part_num, part_size, total_parts, filepath, progress, semaphore))
 
                 progress_task = asyncio.create_task(update_single_progress())
 
@@ -2318,9 +2135,6 @@ class MPDLeechBot:
 
                     self.progress_state['stage'] = "Finalizing"
                     self.progress_state['percent'] = 100.0
-                    # Detect user type for progress display
-                    user_type = "SESSION" if (admin_client and SESSION_STRING) else ("PREMIUM" if is_premium else "FREE")
-                    
                     display = progress_display(
                         self.progress_state['stage'],
                         self.progress_state['percent'],
@@ -2329,7 +2143,7 @@ class MPDLeechBot:
                         self.progress_state['speed'],
                         self.progress_state['elapsed'],
                         sender.first_name,
-                        user_type,
+                        sender.id,
                         os.path.basename(filepath)
                     )
                     async with self.update_lock:
@@ -2370,15 +2184,13 @@ class MPDLeechBot:
                     except Exception as e:
                         logging.warning(f"Failed to extract video metadata: {e}")
 
-                    # Upload to log channel using session string client (preferred for large files)
-                    async def upload_single_to_log_channel():
-                        # Use session string client if available, otherwise fall back to bot client
-                        upload_client = admin_client if admin_client else client
+                    # Send the file
+                    async def send_single_file_operation():
                         if thumbnail_file and os.path.exists(thumbnail_file):
-                            return await upload_client.send_file(
-                                LOG_CHANNEL_ID,
+                            return await client.send_file(
+                                event.chat_id,
                                 file=input_file_big,
-                                caption=f"{os.path.basename(filepath)} - User: {sender.id}",
+                                caption=f"{os.path.basename(filepath)}",
                                 thumb=thumbnail_file,
                                 attributes=[DocumentAttributeVideo(
                                     duration=video_duration, 
@@ -2389,10 +2201,10 @@ class MPDLeechBot:
                                 force_document=False
                             )
                         else:
-                            return await upload_client.send_file(
-                                LOG_CHANNEL_ID,
+                            return await client.send_file(
+                                event.chat_id,
                                 file=input_file_big,
-                                caption=f"{os.path.basename(filepath)} - User: {sender.id}",
+                                caption=f"{os.path.basename(filepath)}",
                                 attributes=[DocumentAttributeVideo(
                                     duration=video_duration, 
                                     w=video_width, 
@@ -2402,35 +2214,11 @@ class MPDLeechBot:
                                 force_document=False
                             )
 
-                    # Upload to log channel
-                    log_msg = await retry_with_backoff(
-                        coroutine=upload_single_to_log_channel,
-                        max_retries=3,
-                        base_delay=1,
-                        operation_name="Upload single file to log channel"
-                    )
-
-                    # Send file from log channel to user (appears as new message without forwarding label)
-                    async def send_single_to_user():
-                        return await client.send_file(
-                            entity=event.chat_id,
-                            file=log_msg.media,
-                            caption=f"{os.path.basename(filepath)}",
-                            thumb=thumbnail_file if thumbnail_file and os.path.exists(thumbnail_file) else None,
-                            attributes=[DocumentAttributeVideo(
-                                duration=video_duration, 
-                                w=video_width, 
-                                h=video_height, 
-                                supports_streaming=True
-                            )],
-                            force_document=False
-                        )
-
                     sent_msg = await retry_with_backoff(
-                        coroutine=send_single_to_user,
+                        coroutine=send_single_file_operation,
                         max_retries=3,
                         base_delay=1,
-                        operation_name="Send single file to user"
+                        operation_name="Send single file"
                     )
 
                     # Clean up temp thumbnail
@@ -2696,13 +2484,10 @@ class MPDLeechBot:
         logging.info(f"Queue processor finished for user {self.user_id}")
 
     async def detect_premium_status(self, user_id):
-        """Detect if user has premium status with multiple methods using session string client"""
+        """Detect if user has premium status with multiple methods"""
         try:
-            # Use admin client (session string) if available, otherwise fall back to bot client
-            detection_client = admin_client if admin_client else client
-            
             # Get full user entity with all attributes
-            user = await detection_client.get_entity(user_id)
+            user = await client.get_entity(user_id)
 
             # Method 1: Check premium attribute directly
             if hasattr(user, 'premium') and user.premium:
@@ -2723,23 +2508,14 @@ class MPDLeechBot:
                     logging.info(f"User {user_id} detected as premium via flags")
                     return True
 
-            # Method 4: If using session string, check session client's own premium status as additional indicator
-            if admin_client and detection_client == admin_client:
-                try:
-                    session_me = await admin_client.get_me()
-                    if hasattr(session_me, 'premium') and session_me.premium:
-                        logging.info(f"Session account is premium, allowing premium limits for user {user_id}")
-                        return True
-                except Exception as e:
-                    logging.warning(f"Could not check session account premium status: {e}")
-
-            # Method 5: Default to free user for proper file size limits
-            logging.info(f"User {user_id} - detected as free user")
-            return False
+            # Method 4: Assume premium for now to allow larger uploads
+            # This is safer than blocking legitimate premium users
+            logging.info(f"User {user_id} - assuming premium for large file support")
+            return True
 
         except Exception as e:
-            logging.warning(f"Could not detect premium status for user {user_id}: {e}, assuming free user")
-            return False  # Default to free user for proper limits
+            logging.warning(f"Could not detect premium status for user {user_id}: {e}, assuming premium for safety")
+            return True  # Default to premium to avoid blocking large uploads
 
 
 @client.on(events.NewMessage(pattern=r'^/start'))
@@ -4181,24 +3957,18 @@ async def skip_handler(event):
 
 # Main function to start the bot
 async def main():
-    global admin_client
-    
     while True:
         try:
-            # Initialize and start admin client if session string is available
+            # Start client with appropriate method
             if SESSION_STRING and SESSION_STRING.strip():
                 try:
-                    session = StringSession(SESSION_STRING.strip())
-                    admin_client = TelegramClient(session, API_ID, API_HASH, connection_retries=5, auto_reconnect=True)
-                    await admin_client.start()
-                    admin_me = await admin_client.get_me()
-                    print(f"Admin session ready: @{admin_me.username if hasattr(admin_me, 'username') and admin_me.username else admin_me.id}")
+                    await client.start()
                 except Exception as e:
-                    print(f"Admin session failed: {e}")
-                    admin_client = None
+                    print(f"Session failed: {e}, using bot token")
+                    await client.start(bot_token=BOT_TOKEN)
+            else:
+                await client.start(bot_token=BOT_TOKEN)
 
-            # Start bot client
-            await client.start(bot_token=BOT_TOKEN)
             me = await client.get_me()
             print(f"Bot ready: @{me.username if hasattr(me, 'username') and me.username else me.id}")
 
